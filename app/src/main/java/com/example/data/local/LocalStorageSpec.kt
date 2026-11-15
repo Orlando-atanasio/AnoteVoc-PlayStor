@@ -5,5 +5,5 @@ package com.example.data.local
  */
 object LocalStorageSpec {
   const val DATABASE_NAME: String = "anotevoce_local.db"
-  const val DATABASE_VERSION: Int = 3
+  const val DATABASE_VERSION: Int = 4
 }

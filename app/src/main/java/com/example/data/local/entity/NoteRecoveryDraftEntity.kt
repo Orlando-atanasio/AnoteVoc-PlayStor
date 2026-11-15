@@ -25,6 +25,7 @@ data class NoteRecoveryDraftEntity(
   @ColumnInfo(name = "session_id") val sessionId: String,
   @ColumnInfo(name = "folder_id") val folderId: Long? = null,
   @ColumnInfo(name = "initial_folder_id") val initialFolderId: Long? = null,
+  @ColumnInfo(name = "fallback_source_folder_id") val fallbackSourceFolderId: Long? = null,
   @ColumnInfo(name = "is_pinned", defaultValue = "0") val isPinned: Boolean = false,
   @ColumnInfo(name = "title") val title: String,
   @ColumnInfo(name = "content_json") val contentJson: String,

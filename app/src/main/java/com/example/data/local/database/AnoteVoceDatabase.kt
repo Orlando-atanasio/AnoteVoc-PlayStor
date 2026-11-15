@@ -34,13 +34,14 @@ abstract class AnoteVoceDatabase : RoomDatabase() {
 
   companion object {
     /**
-     * Lista de migrações explícitas (v1 -> v2 -> v3),
+     * Lista de migrações explícitas (v1 -> v2 -> v3 -> v4),
      * evitando perda de dados e proibindo fallbackToDestructiveMigration().
      */
     val ALL_MIGRATIONS: Array<Migration> =
       arrayOf(
         AnoteVoceMigrations.MIGRATION_1_2,
         AnoteVoceMigrations.MIGRATION_2_3,
+        AnoteVoceMigrations.MIGRATION_3_4,
       )
 
     fun build(context: Context): AnoteVoceDatabase =

@@ -79,6 +79,21 @@ object AnoteVoceMigrations {
       }
     }
 
+  /**
+   * Migração v3 -> v4:
+   * - Acrescenta `fallback_source_folder_id` como coluna anulável em
+   *   `note_recovery_drafts`, preservando integralmente os registros existentes com `NULL`
+   *   (sem preenchimento automático a partir de `folder_id`, `initial_folder_id` ou outro campo).
+   */
+  val MIGRATION_3_4: Migration =
+    object : Migration(3, 4) {
+      override fun migrate(db: SupportSQLiteDatabase) {
+        db.execSQL(
+          "ALTER TABLE `note_recovery_drafts` ADD COLUMN `fallback_source_folder_id` INTEGER"
+        )
+      }
+    }
+
   internal fun resolveValidGlobalPaper(db: SupportSQLiteDatabase): String {
     db.query("SELECT `default_note_paper` FROM `app_preferences` WHERE `id` = 1 LIMIT 1").use {
       cursor ->

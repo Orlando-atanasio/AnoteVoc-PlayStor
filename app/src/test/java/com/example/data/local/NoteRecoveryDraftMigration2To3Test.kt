@@ -161,7 +161,7 @@ class NoteRecoveryDraftMigration2To3Test {
 
     try {
       val writableDb = migratedDb.openHelper.writableDatabase
-      assertEquals(3, writableDb.version)
+      assertEquals(LocalStorageSpec.DATABASE_VERSION, writableDb.version)
 
       writableDb
         .query(
@@ -262,7 +262,7 @@ class NoteRecoveryDraftMigration2To3Test {
         .build()
 
     try {
-      assertEquals(3, migratedDb.openHelper.writableDatabase.version)
+      assertEquals(LocalStorageSpec.DATABASE_VERSION, migratedDb.openHelper.writableDatabase.version)
 
       val migratedNote = migratedDb.noteDao().getById(55L)!!
       assertEquals("Nota v1", migratedNote.title)
@@ -288,6 +288,7 @@ class NoteRecoveryDraftMigration2To3Test {
             sessionId = sessionId,
             folderId = null,
             initialFolderId = 7L,
+            fallbackSourceFolderId = null,
             isPinned = false,
             title = "Nova pós-migração",
             content = NoteContentDocument(blocks = listOf(ParagraphBlock(id = "n1", text = "Texto"))),
@@ -359,6 +360,7 @@ class NoteRecoveryDraftMigration2To3Test {
             sessionId = newSession,
             folderId = folderChanged.id,
             initialFolderId = folderInitial.id,
+            fallbackSourceFolderId = null,
             isPinned = true,
             title = "Nova editada",
             content = NoteContentDocument(blocks = listOf(ParagraphBlock(id = "b1", text = "Corpo"))),
@@ -393,6 +395,7 @@ class NoteRecoveryDraftMigration2To3Test {
             sessionId = existingSession,
             folderId = folderChanged.id,
             initialFolderId = folderInitial.id,
+            fallbackSourceFolderId = null,
             isPinned = false,
             title = "Nota editada",
             content = NoteContentDocument(blocks = listOf(ParagraphBlock(id = "e1", text = "Alterada"))),

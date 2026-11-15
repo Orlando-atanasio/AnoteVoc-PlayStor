@@ -175,6 +175,7 @@ fun NoteRecoveryDraftEntity.toDomain(): NoteRecoveryDraft =
     sessionId = sessionId,
     folderId = folderId,
     initialFolderId = initialFolderId,
+    fallbackSourceFolderId = fallbackSourceFolderId,
     isPinned = isPinned,
     title = title,
     contentState = NoteContentCodec.decode(contentJson),

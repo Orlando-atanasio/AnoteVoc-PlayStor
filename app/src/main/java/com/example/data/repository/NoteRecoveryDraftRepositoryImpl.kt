@@ -8,8 +8,10 @@ import com.example.data.local.dao.NoteRecoveryDraftDao
 import com.example.data.local.database.AnoteVoceDatabase
 import com.example.data.local.entity.NoteRecoveryDraftEntity
 import com.example.data.local.mapper.NoteContentCodec
+import com.example.data.local.mapper.enumValueOrNull
 import com.example.data.local.mapper.toDomain
 import com.example.domain.model.NoteContentState
+import com.example.domain.model.NotePaperStyle
 import com.example.domain.model.NoteRecoveryDraft
 import com.example.domain.model.NoteRecoveryDraftInput
 import com.example.domain.model.NoteRecoveryDraftKeys
@@ -64,6 +66,18 @@ class NoteRecoveryDraftRepositoryImpl(
 
       if (input.checkpointRevision <= 0L) {
         throw InvalidRecoveryDraftException("A revisão do checkpoint deve ser positiva.")
+      }
+
+      if (input.fallbackSourceFolderId != null && input.fallbackSourceFolderId <= 0L) {
+        throw InvalidRecoveryDraftException(
+          "Identificador fallbackSourceFolderId inválido: ${input.fallbackSourceFolderId}."
+        )
+      }
+
+      if (input.folderId != null && input.fallbackSourceFolderId != null) {
+        throw InvalidRecoveryDraftException(
+          "folderId e fallbackSourceFolderId são mutuamente exclusivos e não podem coexistir no checkpoint."
+        )
       }
 
       if (input.targetNoteId == null) {
@@ -156,10 +170,48 @@ class NoteRecoveryDraftRepositoryImpl(
         val contentJson = NoteContentCodec.encode(normalizedContent)
         val now = clock.nowMillis()
 
-        val resolvedInitialFolderId =
-          if (input.targetNoteId == null) input.initialFolderId else null
-        val resolvedInitialPaperStyle =
-          if (input.targetNoteId == null) input.initialPaperStyle?.name else null
+        val resolvedInitialFolderId: Long?
+        val resolvedInitialPaperStyle: String?
+        if (input.targetNoteId == null) {
+          if (existingByDraftId != null) {
+            if (input.initialFolderId != existingByDraftId.initialFolderId) {
+              throw InvalidRecoveryDraftException(
+                "Não é permitido alterar initialFolderId de um checkpoint existente."
+              )
+            }
+            val existingRawPaper = existingByDraftId.initialPaperStyle
+            val existingKnownPaper = enumValueOrNull<NotePaperStyle>(existingRawPaper)
+            if (existingRawPaper == null) {
+              if (input.initialPaperStyle != null) {
+                throw InvalidRecoveryDraftException(
+                  "Não é permitido alterar initialPaperStyle de um checkpoint legado existente."
+                )
+              }
+              resolvedInitialPaperStyle = null
+            } else if (existingKnownPaper != null) {
+              if (input.initialPaperStyle != existingKnownPaper) {
+                throw InvalidRecoveryDraftException(
+                  "Não é permitido alterar initialPaperStyle de um checkpoint existente."
+                )
+              }
+              resolvedInitialPaperStyle = existingRawPaper
+            } else {
+              if (input.initialPaperStyle != null) {
+                throw InvalidRecoveryDraftException(
+                  "Não é permitido alterar initialPaperStyle de um checkpoint existente."
+                )
+              }
+              resolvedInitialPaperStyle = existingRawPaper
+            }
+            resolvedInitialFolderId = existingByDraftId.initialFolderId
+          } else {
+            resolvedInitialFolderId = input.initialFolderId
+            resolvedInitialPaperStyle = input.initialPaperStyle?.name
+          }
+        } else {
+          resolvedInitialFolderId = null
+          resolvedInitialPaperStyle = null
+        }
 
         val entity =
           NoteRecoveryDraftEntity(
@@ -168,6 +220,7 @@ class NoteRecoveryDraftRepositoryImpl(
             sessionId = cleanSessionId,
             folderId = input.folderId,
             initialFolderId = resolvedInitialFolderId,
+            fallbackSourceFolderId = input.fallbackSourceFolderId,
             isPinned = input.isPinned,
             title = input.title,
             contentJson = contentJson,

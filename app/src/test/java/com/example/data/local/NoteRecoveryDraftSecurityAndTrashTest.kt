@@ -132,6 +132,7 @@ class NoteRecoveryDraftSecurityAndTrashTest {
             targetNoteId = note.id,
             sessionId = session1,
             folderId = null,
+            fallbackSourceFolderId = null,
             isPinned = false,
             title = "Edição Sessão 1",
             content =
@@ -149,6 +150,7 @@ class NoteRecoveryDraftSecurityAndTrashTest {
             targetNoteId = note.id,
             sessionId = session2,
             folderId = null,
+            fallbackSourceFolderId = null,
             isPinned = false,
             title = "Edição Sessão 2",
             content =
@@ -202,6 +204,7 @@ class NoteRecoveryDraftSecurityAndTrashTest {
           targetNoteId = note.id,
           sessionId = sessionA,
           folderId = null,
+          fallbackSourceFolderId = null,
           isPinned = false,
           title = "Rascunho A",
           content = NoteContentDocument(blocks = listOf(ParagraphBlock(id = "p1", text = "Conteúdo A"))),
@@ -220,6 +223,7 @@ class NoteRecoveryDraftSecurityAndTrashTest {
             targetNoteId = note.id,
             sessionId = sessionB,
             folderId = null,
+            fallbackSourceFolderId = null,
             isPinned = false,
             title = "Sobrescrita por sessão B",
             content = NoteContentDocument(blocks = listOf(ParagraphBlock(id = "p1", text = "Texto B"))),
@@ -243,6 +247,7 @@ class NoteRecoveryDraftSecurityAndTrashTest {
             targetNoteId = null,
             sessionId = sessionA,
             folderId = null,
+            fallbackSourceFolderId = null,
             isPinned = false,
             title = "Sequestro de sessão",
             content = NoteContentDocument.empty(),
@@ -295,6 +300,7 @@ class NoteRecoveryDraftSecurityAndTrashTest {
             targetNoteId = note.id,
             sessionId = sessionId,
             folderId = null,
+            fallbackSourceFolderId = null,
             isPinned = false,
             title = "Título Rev 2",
             content = NoteContentDocument(blocks = listOf(ParagraphBlock(id = "p1", text = "Texto Rev 2"))),
@@ -313,6 +319,7 @@ class NoteRecoveryDraftSecurityAndTrashTest {
             targetNoteId = note.id,
             sessionId = sessionId,
             folderId = null,
+            fallbackSourceFolderId = null,
             isPinned = false,
             title = "Título Rev 1 atrasada",
             content = NoteContentDocument(blocks = listOf(ParagraphBlock(id = "p1", text = "Atrasada"))),
@@ -331,6 +338,7 @@ class NoteRecoveryDraftSecurityAndTrashTest {
             targetNoteId = note.id,
             sessionId = sessionId,
             folderId = null,
+            fallbackSourceFolderId = null,
             isPinned = false,
             title = "Título Rev 2 duplicado",
             content = NoteContentDocument(blocks = listOf(ParagraphBlock(id = "p1", text = "Duplicado"))),
@@ -364,6 +372,7 @@ class NoteRecoveryDraftSecurityAndTrashTest {
             targetNoteId = note.id,
             sessionId = session,
             folderId = null,
+            fallbackSourceFolderId = null,
             isPinned = false,
             title = "Erro",
             content = NoteContentDocument.empty(),
@@ -377,6 +386,7 @@ class NoteRecoveryDraftSecurityAndTrashTest {
             targetNoteId = null,
             sessionId = session,
             folderId = null,
+            fallbackSourceFolderId = null,
             isPinned = false,
             title = "Erro",
             content = NoteContentDocument.empty(),
@@ -391,6 +401,7 @@ class NoteRecoveryDraftSecurityAndTrashTest {
             targetNoteId = note.id,
             sessionId = session,
             folderId = null,
+            fallbackSourceFolderId = null,
             isPinned = false,
             title = "Erro",
             content = NoteContentDocument.empty(),
@@ -405,6 +416,7 @@ class NoteRecoveryDraftSecurityAndTrashTest {
             targetNoteId = note.id,
             sessionId = session,
             folderId = null,
+            fallbackSourceFolderId = null,
             isPinned = false,
             title = "Erro",
             content = NoteContentDocument.empty(),
@@ -419,6 +431,7 @@ class NoteRecoveryDraftSecurityAndTrashTest {
             targetNoteId = null,
             sessionId = "sessao com espaco",
             folderId = null,
+            fallbackSourceFolderId = null,
             isPinned = false,
             title = "Erro",
             content = NoteContentDocument.empty(),
@@ -432,6 +445,7 @@ class NoteRecoveryDraftSecurityAndTrashTest {
             targetNoteId = null,
             sessionId = "NEW",
             folderId = null,
+            fallbackSourceFolderId = null,
             isPinned = false,
             title = "Erro",
             content = NoteContentDocument.empty(),
@@ -446,6 +460,7 @@ class NoteRecoveryDraftSecurityAndTrashTest {
             targetNoteId = note.id,
             sessionId = session,
             folderId = null,
+            fallbackSourceFolderId = null,
             isPinned = false,
             title = "Base 0",
             content = NoteContentDocument.empty(),
@@ -459,6 +474,7 @@ class NoteRecoveryDraftSecurityAndTrashTest {
             targetNoteId = note.id,
             sessionId = session,
             folderId = null,
+            fallbackSourceFolderId = null,
             isPinned = false,
             title = "Base negativa",
             content = NoteContentDocument.empty(),
@@ -472,6 +488,7 @@ class NoteRecoveryDraftSecurityAndTrashTest {
             targetNoteId = note.id,
             sessionId = session,
             folderId = null,
+            fallbackSourceFolderId = null,
             isPinned = false,
             title = "Base futura",
             content = NoteContentDocument.empty(),
@@ -485,6 +502,7 @@ class NoteRecoveryDraftSecurityAndTrashTest {
             targetNoteId = note.id,
             sessionId = session,
             folderId = null,
+            fallbackSourceFolderId = null,
             isPinned = false,
             title = "Timestamp nulo",
             content = NoteContentDocument.empty(),
@@ -498,6 +516,7 @@ class NoteRecoveryDraftSecurityAndTrashTest {
             targetNoteId = note.id,
             sessionId = session,
             folderId = null,
+            fallbackSourceFolderId = null,
             isPinned = false,
             title = "Timestamp divergente",
             content = NoteContentDocument.empty(),
@@ -512,6 +531,7 @@ class NoteRecoveryDraftSecurityAndTrashTest {
             targetNoteId = null,
             sessionId = session,
             folderId = null,
+            fallbackSourceFolderId = null,
             isPinned = false,
             title = "Nova com baseRevision",
             content = NoteContentDocument.empty(),
@@ -525,6 +545,7 @@ class NoteRecoveryDraftSecurityAndTrashTest {
             targetNoteId = null,
             sessionId = session,
             folderId = null,
+            fallbackSourceFolderId = null,
             isPinned = false,
             title = "Nova com baseTimestamp",
             content = NoteContentDocument.empty(),
@@ -605,6 +626,7 @@ class NoteRecoveryDraftSecurityAndTrashTest {
             targetNoteId = note.id,
             sessionId = "s-valid",
             folderId = null,
+            fallbackSourceFolderId = null,
             isPinned = false,
             title = "Válido para note",
             content = NoteContentDocument.empty(),
@@ -647,6 +669,7 @@ class NoteRecoveryDraftSecurityAndTrashTest {
             targetNoteId = deletedNote.id,
             sessionId = "s-del",
             folderId = null,
+            fallbackSourceFolderId = null,
             isPinned = false,
             title = "Tentativa em apagada",
             content = NoteContentDocument.empty(),
@@ -668,6 +691,7 @@ class NoteRecoveryDraftSecurityAndTrashTest {
             targetNoteId = 999_999L,
             sessionId = "s-missing",
             folderId = null,
+            fallbackSourceFolderId = null,
             isPinned = false,
             title = "Inexistente",
             content = NoteContentDocument.empty(),
@@ -690,6 +714,7 @@ class NoteRecoveryDraftSecurityAndTrashTest {
             targetNoteId = futureId,
             sessionId = "s-future",
             folderId = null,
+            fallbackSourceFolderId = null,
             isPinned = false,
             title = "Sobrescrita futura",
             content = NoteContentDocument.empty(),
@@ -712,6 +737,7 @@ class NoteRecoveryDraftSecurityAndTrashTest {
           targetNoteId = activeNote.id,
           sessionId = "s-active",
           folderId = deletedFolder.id,
+          fallbackSourceFolderId = null,
           isPinned = false,
           title = "Novo título em rascunho",
           content = NoteContentDocument(blocks = listOf(ParagraphBlock(id = "p1", text = "Rascunho"))),
@@ -876,6 +902,7 @@ class NoteRecoveryDraftSecurityAndTrashTest {
           targetNoteId = noteA.id,
           sessionId = "sessao-a",
           folderId = null,
+          fallbackSourceFolderId = null,
           isPinned = false,
           title = "Rascunho A",
           content = NoteContentDocument(blocks = listOf(ParagraphBlock(id = "a1", text = "Editado A"))),
@@ -891,6 +918,7 @@ class NoteRecoveryDraftSecurityAndTrashTest {
           targetNoteId = noteB.id,
           sessionId = "sessao-b",
           folderId = null,
+          fallbackSourceFolderId = null,
           isPinned = false,
           title = "Rascunho B",
           content = NoteContentDocument(blocks = listOf(ParagraphBlock(id = "b1", text = "Editado B"))),
@@ -906,6 +934,7 @@ class NoteRecoveryDraftSecurityAndTrashTest {
           targetNoteId = null,
           sessionId = "sessao-nova",
           folderId = null,
+          fallbackSourceFolderId = null,
           isPinned = false,
           title = "Rascunho Nova",
           content = NoteContentDocument(blocks = listOf(ParagraphBlock(id = "n1", text = "Texto novo"))),
@@ -1027,6 +1056,7 @@ class NoteRecoveryDraftSecurityAndTrashTest {
           targetNoteId = existingNote.id,
           sessionId = "sessao-ex",
           folderId = null,
+          fallbackSourceFolderId = null,
           isPinned = false,
           title = "Rascunho existente",
           content = NoteContentDocument(blocks = listOf(ParagraphBlock(id = "e1", text = "Alterado"))),
@@ -1042,6 +1072,7 @@ class NoteRecoveryDraftSecurityAndTrashTest {
           targetNoteId = null,
           sessionId = "sessao-n1",
           folderId = null,
+          fallbackSourceFolderId = null,
           isPinned = true,
           title = "Nova nota 1",
           content = NoteContentDocument(blocks = listOf(ParagraphBlock(id = "n1", text = "Corpo 1"))),
@@ -1057,6 +1088,7 @@ class NoteRecoveryDraftSecurityAndTrashTest {
           targetNoteId = null,
           sessionId = "sessao-n2",
           folderId = null,
+          fallbackSourceFolderId = null,
           isPinned = false,
           title = "Nova nota 2",
           content = NoteContentDocument(blocks = listOf(ParagraphBlock(id = "n2", text = "Corpo 2"))),
@@ -1147,6 +1179,7 @@ class NoteRecoveryDraftSecurityAndTrashTest {
           targetNoteId = baseNote.id,
           sessionId = "sessao-base",
           folderId = null,
+          fallbackSourceFolderId = null,
           isPinned = false,
           title = "Rascunho nota base",
           content = NoteContentDocument(blocks = listOf(ParagraphBlock(id = "b1", text = "Editado"))),
@@ -1162,6 +1195,7 @@ class NoteRecoveryDraftSecurityAndTrashTest {
           targetNoteId = null,
           sessionId = "sessao-new",
           folderId = null,
+          fallbackSourceFolderId = null,
           isPinned = false,
           title = "Rascunho nova nota",
           content = NoteContentDocument(blocks = listOf(ParagraphBlock(id = "n1", text = "Novo"))),
@@ -1219,5 +1253,384 @@ class NoteRecoveryDraftSecurityAndTrashTest {
       assertNotNull(draftRepository.getCheckpointById(existingDraftId))
       assertNotNull(draftRepository.getCheckpointById(newDraftId))
       assertEquals(2, draftRepository.getAllCheckpoints().size)
+    }
+
+  @Test
+  fun `existing checkpoint rejects changing targetNoteId or sessionId and preserves all original fields`() =
+    runTest {
+      val folderInitial = folderRepository.createFolder("Origem Identidade")
+      val folderFallback = folderRepository.createFolder("Fallback Identidade")
+      val noteA =
+        noteRepository.createNote(
+          title = "Nota A protegida",
+          content = NoteContentDocument(blocks = listOf(ParagraphBlock(id = "na1", text = "Base A"))),
+        )
+      val noteB =
+        noteRepository.createNote(
+          title = "Nota B protegida",
+          content = NoteContentDocument(blocks = listOf(ParagraphBlock(id = "nb1", text = "Base B"))),
+        )
+
+      // 1. Checkpoint de nova nota tentando mudar targetNoteId para nota existente ou mudar sessionId
+      val newSessionId = "sessao-ident-nova"
+      val newDraftId = NoteRecoveryDraftKeys.forNewNote(newSessionId)
+      draftRepository.saveCheckpoint(
+        NoteRecoveryDraftInput(
+          draftId = newDraftId,
+          targetNoteId = null,
+          sessionId = newSessionId,
+          folderId = null,
+          initialFolderId = folderInitial.id,
+          fallbackSourceFolderId = folderFallback.id,
+          isPinned = true,
+          title = "Nova protegida",
+          content =
+            NoteContentDocument(blocks = listOf(ParagraphBlock(id = "np1", text = "Corpo nova protegido"))),
+          paperStyle = NotePaperStyle.SUNSET_WARMTH,
+          initialPaperStyle = NotePaperStyle.FOREST_MIST,
+          baseRevision = 0L,
+          checkpointRevision = 3L,
+          baseNoteUpdatedAt = null,
+        )
+      )
+
+      val newAttempts =
+        listOf(
+          // Mesmo draftId de nova nota tentando trocar targetNoteId para noteA.id e burlar iniciais
+          NoteRecoveryDraftInput(
+            draftId = newDraftId,
+            targetNoteId = noteA.id,
+            sessionId = newSessionId,
+            folderId = null,
+            initialFolderId = null,
+            fallbackSourceFolderId = null,
+            isPinned = false,
+            title = "Sequestro para nota existente",
+            content = NoteContentDocument.empty(),
+            paperStyle = NotePaperStyle.LINHAS,
+            initialPaperStyle = null,
+            baseRevision = noteA.revision,
+            checkpointRevision = 4L,
+            baseNoteUpdatedAt = noteA.updatedAt,
+          ),
+          // Chave forExistingNote reutilizando sessionId da nova nota
+          NoteRecoveryDraftInput(
+            draftId = NoteRecoveryDraftKeys.forExistingNote(noteA.id, newSessionId),
+            targetNoteId = noteA.id,
+            sessionId = newSessionId,
+            folderId = null,
+            initialFolderId = null,
+            fallbackSourceFolderId = null,
+            isPinned = false,
+            title = "Reuso de sessionId como nota existente",
+            content = NoteContentDocument.empty(),
+            paperStyle = NotePaperStyle.LINHAS,
+            initialPaperStyle = null,
+            baseRevision = noteA.revision,
+            checkpointRevision = 4L,
+            baseNoteUpdatedAt = noteA.updatedAt,
+          ),
+          // Mesmo draftId tentando trocar sessionId
+          NoteRecoveryDraftInput(
+            draftId = newDraftId,
+            targetNoteId = null,
+            sessionId = "sessao-ident-alterada",
+            folderId = null,
+            initialFolderId = folderInitial.id,
+            fallbackSourceFolderId = folderFallback.id,
+            isPinned = false,
+            title = "Troca de sessionId",
+            content = NoteContentDocument.empty(),
+            paperStyle = NotePaperStyle.LINHAS,
+            initialPaperStyle = NotePaperStyle.FOREST_MIST,
+            baseRevision = 0L,
+            checkpointRevision = 4L,
+            baseNoteUpdatedAt = null,
+          ),
+        )
+
+      for ((idx, attempt) in newAttempts.withIndex()) {
+        try {
+          draftRepository.saveCheckpoint(attempt)
+          fail("Tentativa #$idx deveria ter lançado InvalidRecoveryDraftException")
+        } catch (_: InvalidRecoveryDraftException) {
+          val reloaded = draftRepository.getCheckpointById(newDraftId)!!
+          assertEquals(newDraftId, reloaded.draftId)
+          assertEquals(newSessionId, reloaded.sessionId)
+          assertNull(reloaded.targetNoteId)
+          assertEquals(folderInitial.id, reloaded.initialFolderId)
+          assertEquals(NotePaperStyle.FOREST_MIST, reloaded.initialPaperStyle)
+          assertEquals(folderFallback.id, reloaded.fallbackSourceFolderId)
+          assertNull(reloaded.folderId)
+          assertTrue(reloaded.isPinned)
+          assertEquals("Nova protegida", reloaded.title)
+          assertEquals("Corpo nova protegido", reloaded.contentOrNull!!.blocks.first().text)
+          assertEquals(NotePaperStyle.SUNSET_WARMTH, reloaded.paperStyle)
+          assertEquals(3L, reloaded.checkpointRevision)
+        }
+      }
+
+      // 2. Checkpoint de nota existente tentando mudar targetNoteId para null, para noteB ou mudar sessionId
+      val existingSessionId = "sessao-ident-ex"
+      val existingDraftId = NoteRecoveryDraftKeys.forExistingNote(noteA.id, existingSessionId)
+      draftRepository.saveCheckpoint(
+        NoteRecoveryDraftInput(
+          draftId = existingDraftId,
+          targetNoteId = noteA.id,
+          sessionId = existingSessionId,
+          folderId = null,
+          initialFolderId = null,
+          fallbackSourceFolderId = folderFallback.id,
+          isPinned = false,
+          title = "Editando Nota A",
+          content =
+            NoteContentDocument(blocks = listOf(ParagraphBlock(id = "na1", text = "Corpo A protegido"))),
+          paperStyle = NotePaperStyle.OCEAN_BREEZE,
+          initialPaperStyle = null,
+          baseRevision = noteA.revision,
+          checkpointRevision = 4L,
+          baseNoteUpdatedAt = noteA.updatedAt,
+        )
+      )
+
+      val existingAttempts =
+        listOf(
+          // Nota existente tentando mudar targetNoteId para null mantendo draftId
+          NoteRecoveryDraftInput(
+            draftId = existingDraftId,
+            targetNoteId = null,
+            sessionId = existingSessionId,
+            folderId = null,
+            initialFolderId = null,
+            fallbackSourceFolderId = null,
+            isPinned = false,
+            title = "Downgrade para nova nota",
+            content = NoteContentDocument.empty(),
+            paperStyle = NotePaperStyle.LINHAS,
+            initialPaperStyle = null,
+            baseRevision = 0L,
+            checkpointRevision = 5L,
+            baseNoteUpdatedAt = null,
+          ),
+          // Chave forNewNote reutilizando sessionId da nota existente
+          NoteRecoveryDraftInput(
+            draftId = NoteRecoveryDraftKeys.forNewNote(existingSessionId),
+            targetNoteId = null,
+            sessionId = existingSessionId,
+            folderId = null,
+            initialFolderId = null,
+            fallbackSourceFolderId = null,
+            isPinned = false,
+            title = "Reuso de sessionId como nova nota",
+            content = NoteContentDocument.empty(),
+            paperStyle = NotePaperStyle.LINHAS,
+            initialPaperStyle = null,
+            baseRevision = 0L,
+            checkpointRevision = 5L,
+            baseNoteUpdatedAt = null,
+          ),
+          // Nota existente tentando mudar targetNoteId para noteB mantendo draftId
+          NoteRecoveryDraftInput(
+            draftId = existingDraftId,
+            targetNoteId = noteB.id,
+            sessionId = existingSessionId,
+            folderId = null,
+            initialFolderId = null,
+            fallbackSourceFolderId = null,
+            isPinned = false,
+            title = "Troca para nota B",
+            content = NoteContentDocument.empty(),
+            paperStyle = NotePaperStyle.LINHAS,
+            initialPaperStyle = null,
+            baseRevision = noteB.revision,
+            checkpointRevision = 5L,
+            baseNoteUpdatedAt = noteB.updatedAt,
+          ),
+          // Chave forExistingNote(noteB) reutilizando sessionId de noteA
+          NoteRecoveryDraftInput(
+            draftId = NoteRecoveryDraftKeys.forExistingNote(noteB.id, existingSessionId),
+            targetNoteId = noteB.id,
+            sessionId = existingSessionId,
+            folderId = null,
+            initialFolderId = null,
+            fallbackSourceFolderId = null,
+            isPinned = false,
+            title = "Reuso de sessionId em noteB",
+            content = NoteContentDocument.empty(),
+            paperStyle = NotePaperStyle.LINHAS,
+            initialPaperStyle = null,
+            baseRevision = noteB.revision,
+            checkpointRevision = 5L,
+            baseNoteUpdatedAt = noteB.updatedAt,
+          ),
+          // Mesmo draftId tentando trocar sessionId
+          NoteRecoveryDraftInput(
+            draftId = existingDraftId,
+            targetNoteId = noteA.id,
+            sessionId = "sessao-sequestrada",
+            folderId = null,
+            initialFolderId = null,
+            fallbackSourceFolderId = null,
+            isPinned = false,
+            title = "Troca de sessionId em existente",
+            content = NoteContentDocument.empty(),
+            paperStyle = NotePaperStyle.LINHAS,
+            initialPaperStyle = null,
+            baseRevision = noteA.revision,
+            checkpointRevision = 5L,
+            baseNoteUpdatedAt = noteA.updatedAt,
+          ),
+        )
+
+      for ((idx, attempt) in existingAttempts.withIndex()) {
+        try {
+          draftRepository.saveCheckpoint(attempt)
+          fail("Tentativa existente #$idx deveria ter lançado InvalidRecoveryDraftException")
+        } catch (_: InvalidRecoveryDraftException) {
+          val reloaded = draftRepository.getCheckpointById(existingDraftId)!!
+          assertEquals(existingDraftId, reloaded.draftId)
+          assertEquals(existingSessionId, reloaded.sessionId)
+          assertEquals(noteA.id, reloaded.targetNoteId)
+          assertNull(reloaded.initialFolderId)
+          assertNull(reloaded.initialPaperStyle)
+          assertEquals(folderFallback.id, reloaded.fallbackSourceFolderId)
+          assertNull(reloaded.folderId)
+          assertEquals("Editando Nota A", reloaded.title)
+          assertEquals("Corpo A protegido", reloaded.contentOrNull!!.blocks.first().text)
+          assertEquals(NotePaperStyle.OCEAN_BREEZE, reloaded.paperStyle)
+          assertEquals(4L, reloaded.checkpointRevision)
+        }
+      }
+    }
+
+  @Test
+  fun `transactional identity guards reject updating mismatched persisted entity inserted via dao`() =
+    runTest {
+      val folderInitial = folderRepository.createFolder("Origem DAO")
+      val folderFallback = folderRepository.createFolder("Fallback DAO")
+      val targetNote =
+        noteRepository.createNote(
+          title = "Nota alvo DAO",
+          content = NoteContentDocument(blocks = listOf(ParagraphBlock(id = "d1", text = "Nota DAO"))),
+        )
+
+      val validContentJson =
+        """{"schemaVersion":1,"blocks":[{"type":"paragraph","id":"dao1","text":"Texto original DAO","spans":[]}]}"""
+
+      // Caso 1: Registro gravado via DAO com draftId compatível com note_<id>_<session>, porém targetNoteId = null.
+      // O input do atacante passa em assertConsistentKeys, mas deve falhar dentro de withTransaction (targetNoteId != input.targetNoteId).
+      val mismatchTargetSession = "dao-mismatch-target"
+      val mismatchTargetDraftId =
+        NoteRecoveryDraftKeys.forExistingNote(targetNote.id, mismatchTargetSession)
+      database.noteRecoveryDraftDao().insert(
+        NoteRecoveryDraftEntity(
+          draftId = mismatchTargetDraftId,
+          targetNoteId = null,
+          sessionId = mismatchTargetSession,
+          folderId = null,
+          initialFolderId = folderInitial.id,
+          fallbackSourceFolderId = folderFallback.id,
+          isPinned = true,
+          title = "Original DAO target nulo",
+          contentJson = validContentJson,
+          paperStyle = NotePaperStyle.FOREST_MIST.name,
+          initialPaperStyle = NotePaperStyle.OCEAN_BREEZE.name,
+          baseRevision = 0L,
+          checkpointRevision = 2L,
+          baseNoteUpdatedAt = null,
+          checkpointAt = 10_000L,
+        )
+      )
+
+      try {
+        draftRepository.saveCheckpoint(
+          NoteRecoveryDraftInput(
+            draftId = mismatchTargetDraftId,
+            targetNoteId = targetNote.id,
+            sessionId = mismatchTargetSession,
+            folderId = null,
+            initialFolderId = null,
+            fallbackSourceFolderId = null,
+            isPinned = false,
+            title = "Contorno via DAO targetNoteId",
+            content = NoteContentDocument.empty(),
+            paperStyle = NotePaperStyle.LINHAS,
+            initialPaperStyle = null,
+            baseRevision = targetNote.revision,
+            checkpointRevision = 3L,
+            baseNoteUpdatedAt = targetNote.updatedAt,
+          )
+        )
+        fail("Esperava InvalidRecoveryDraftException pela trava transacional de targetNoteId")
+      } catch (_: InvalidRecoveryDraftException) {
+        val intact = draftRepository.getCheckpointById(mismatchTargetDraftId)!!
+        assertEquals(mismatchTargetDraftId, intact.draftId)
+        assertEquals(mismatchTargetSession, intact.sessionId)
+        assertNull(intact.targetNoteId)
+        assertEquals(folderInitial.id, intact.initialFolderId)
+        assertEquals(NotePaperStyle.OCEAN_BREEZE, intact.initialPaperStyle)
+        assertEquals(folderFallback.id, intact.fallbackSourceFolderId)
+        assertEquals("Original DAO target nulo", intact.title)
+        assertEquals("Texto original DAO", intact.contentOrNull!!.blocks.first().text)
+        assertEquals(2L, intact.checkpointRevision)
+      }
+
+      // Caso 2: Registro gravado via DAO com draftId = new_<atacante>, porém sessionId = "dao-original-owner".
+      // O input do atacante passa em assertConsistentKeys, mas deve falhar dentro de withTransaction (sessionId != cleanSessionId).
+      val attackerSession = "dao-attacker-session"
+      val originalOwnerSession = "dao-original-owner"
+      val mismatchSessionDraftId = NoteRecoveryDraftKeys.forNewNote(attackerSession)
+      database.noteRecoveryDraftDao().insert(
+        NoteRecoveryDraftEntity(
+          draftId = mismatchSessionDraftId,
+          targetNoteId = null,
+          sessionId = originalOwnerSession,
+          folderId = null,
+          initialFolderId = folderInitial.id,
+          fallbackSourceFolderId = folderFallback.id,
+          isPinned = false,
+          title = "Original DAO dono",
+          contentJson = validContentJson,
+          paperStyle = NotePaperStyle.TECH_DARK.name,
+          initialPaperStyle = NotePaperStyle.LINHAS.name,
+          baseRevision = 0L,
+          checkpointRevision = 2L,
+          baseNoteUpdatedAt = null,
+          checkpointAt = 10_001L,
+        )
+      )
+
+      try {
+        draftRepository.saveCheckpoint(
+          NoteRecoveryDraftInput(
+            draftId = mismatchSessionDraftId,
+            targetNoteId = null,
+            sessionId = attackerSession,
+            folderId = null,
+            initialFolderId = folderInitial.id,
+            fallbackSourceFolderId = null,
+            isPinned = true,
+            title = "Contorno via DAO sessionId",
+            content = NoteContentDocument.empty(),
+            paperStyle = NotePaperStyle.LINHAS,
+            initialPaperStyle = NotePaperStyle.LINHAS,
+            baseRevision = 0L,
+            checkpointRevision = 3L,
+            baseNoteUpdatedAt = null,
+          )
+        )
+        fail("Esperava InvalidRecoveryDraftException pela trava transacional de sessionId")
+      } catch (_: InvalidRecoveryDraftException) {
+        val intact = draftRepository.getCheckpointById(mismatchSessionDraftId)!!
+        assertEquals(mismatchSessionDraftId, intact.draftId)
+        assertEquals(originalOwnerSession, intact.sessionId)
+        assertNull(intact.targetNoteId)
+        assertEquals(folderInitial.id, intact.initialFolderId)
+        assertEquals(NotePaperStyle.LINHAS, intact.initialPaperStyle)
+        assertEquals(folderFallback.id, intact.fallbackSourceFolderId)
+        assertEquals("Original DAO dono", intact.title)
+        assertEquals("Texto original DAO", intact.contentOrNull!!.blocks.first().text)
+        assertEquals(2L, intact.checkpointRevision)
+      }
     }
 }
