@@ -1,0 +1,6 @@
+{
+  "name": "AnoteVocê",
+  "description": "Aplicativo Android nativo de anotações pessoais com funcionamento prioritariamente offline (versão 1.0 em pt-BR).",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

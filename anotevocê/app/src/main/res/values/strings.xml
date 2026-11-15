@@ -1,0 +1,42 @@
+<resources>
+    <string name="app_name">AnoteVocê</string>
+    <string name="app_tagline_offline">Offline-first • Local</string>
+
+    <!-- Saudação e áreas principais -->
+    <string name="home_greeting">Que bom ter você por aqui!</string>
+    <string name="nav_all_notes">Todas no meu phone</string>
+    <string name="nav_pinned">Fixadas</string>
+    <string name="nav_trash">Apagados</string>
+    <string name="nav_folders_section">Pastas</string>
+    <string name="nav_folders_empty">Nenhuma pasta criada</string>
+    <string name="nav_folder_fallback_title">Pasta</string>
+
+    <!-- Estados vazios -->
+    <string name="empty_all_notes">Nenhuma nota por aqui</string>
+    <string name="empty_pinned_notes">Nenhuma nota fixada ainda</string>
+    <string name="empty_folder_notes">Esta pasta ainda não tem notas</string>
+    <string name="folder_unavailable_message">Pasta indisponível</string>
+
+    <!-- Apresentação de notas -->
+    <string name="note_untitled">Sem título</string>
+    <string name="note_pinned_badge">Fixada</string>
+    <string name="note_unreadable_future_version">Conteúdo criado em uma versão mais recente do aplicativo (dados originais preservados).</string>
+    <string name="note_unreadable_unknown_block">Conteúdo com recurso não suportado nesta versão (dados originais preservados).</string>
+    <string name="note_unreadable_corrupted">Não foi possível ler este conteúdo com segurança (dados originais preservados).</string>
+
+    <!-- Acessibilidade e semântica -->
+    <string name="cd_app_emblem">Emblema do AnoteVocê</string>
+    <string name="cd_open_drawer">Abrir menu lateral</string>
+    <string name="cd_close_drawer">Fechar menu lateral</string>
+    <string name="cd_expand_drawer">Expandir menu lateral</string>
+    <string name="cd_collapse_drawer">Recolher menu lateral</string>
+    <string name="cd_pinned_note_icon">Nota fixada</string>
+    <string name="cd_folder_icon">Pasta %1$s</string>
+    <string name="cd_empty_all_notes_icon">Nenhuma nota por aqui</string>
+    <string name="cd_empty_pinned_icon">Nenhuma nota fixada ainda</string>
+    <string name="cd_empty_folder_icon">Esta pasta ainda não tem notas</string>
+    <string name="cd_unreadable_note_icon">Conteúdo protegido</string>
+    <string name="state_selected">Selecionado</string>
+    <string name="state_not_selected">Não selecionado</string>
+    <string name="loading_notes">Carregando anotações…</string>
+</resources>
