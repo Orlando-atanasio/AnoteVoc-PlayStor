@@ -267,7 +267,7 @@ object NoteEditorSessionEvaluator {
       ResolvedDraftFolderContext(
         effectiveTarget = effectiveAvailability,
         fallbackSource = fallbackAvailability,
-        initialBaseline = null,
+        initialBaseline = existingFolderAvailability,
         existingNoteFolder = existingFolderAvailability,
       )
     val snapshot =
@@ -402,9 +402,9 @@ object NoteEditorSessionEvaluator {
       }
 
       val canonicalNoteDoc = canonicalizeDocument((noteContentState as NoteContentState.Valid).document)
-      // Nota existente sempre ignora initialFolderId/initialPaperStyle e usa isPinned atual do banco.
-      effectiveInitialFolderAvailability = null
+      // Nota existente sempre ignora initialFolderId/initialPaperStyle e usa folderId/isPinned atuais do banco.
       existingFolderAvailability = resolveFolderAvailability(existingNote.folderId, folderAvailabilityById)
+      effectiveInitialFolderAvailability = existingFolderAvailability
       resolvedIsPinned = existingNote.isPinned
       if (draft.isPinned != existingNote.isPinned) {
         extraWarnings.add(SessionWarning.ExistingNotePinUpdatedExternally(existingNote.isPinned))
@@ -756,10 +756,25 @@ object NoteEditorSessionEvaluator {
         folderAvailabilityById = mergedAvailability,
       )
 
+    val baselineAnchorFolderId =
+      when (baseline) {
+        is NoteEditorBaseline.NewNote -> baseline.staticFolderId
+        is NoteEditorBaseline.ExistingNote -> baseline.staticFolderId
+        is NoteEditorBaseline.LegacyIndeterminate,
+        null -> null
+      }
+    val baselineAnchorIsRoot =
+      when (baseline) {
+        is NoteEditorBaseline.NewNote -> baseline.staticFolderId == null
+        is NoteEditorBaseline.ExistingNote -> baseline.staticFolderId == null
+        is NoteEditorBaseline.LegacyIndeterminate,
+        null -> false
+      }
+
     val preservedInitialBaseline =
       resolvePreservedAnchorAvailability(
-        anchorFolderId = (baseline as? NoteEditorBaseline.NewNote)?.staticFolderId,
-        anchorIsRootBaseline = baseline is NoteEditorBaseline.NewNote && baseline.staticFolderId == null,
+        anchorFolderId = baselineAnchorFolderId,
+        anchorIsRootBaseline = baselineAnchorIsRoot,
         previousAvailability = previousContext?.initialBaseline,
         incomingAvailabilityById = folderAvailabilityById,
         mergedAvailabilityById = mergedAvailability,
@@ -998,13 +1013,13 @@ object NoteEditorSessionEvaluator {
           )
         }
 
-        val initialBaseline = coherentContext.initialBaseline
-        if (initialBaseline != null && initialBaseline.isDefinitelyUnavailable) {
-          initialBaseline.folderIdOrNull?.let { folderId ->
+        val baselineAvailability = coherentContext.initialBaseline ?: coherentContext.existingNoteFolder
+        if (baselineAvailability != null && baselineAvailability.isDefinitelyUnavailable) {
+          baselineAvailability.folderIdOrNull?.let { folderId ->
             add(
               SessionWarning.OriginalBaselineFolderUnavailable(
                 baselineFolderId = folderId,
-                availability = initialBaseline,
+                availability = baselineAvailability,
               )
             )
           }

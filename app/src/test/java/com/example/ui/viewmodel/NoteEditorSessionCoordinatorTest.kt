@@ -74,8 +74,8 @@ class NoteEditorSessionCoordinatorTest {
       }
 
     val folderRepo = TestFolderRepository()
-    val noteRepo = TestNoteRepository(clock)
     val draftRepo = TestDraftRepository(clock)
+    val noteRepo = TestNoteRepository(clock, draftRepo)
     val prefsRepo = TestPreferencesRepository()
     val registry = ActiveSessionRegistry()
     val handoffTracker = ReplacementHandoffTracker(clock)
@@ -663,9 +663,14 @@ class NoteEditorSessionCoordinatorTest {
       h.noteRepo.notes[note.id] = h.noteRepo.getNoteById(note.id)!!.copy(revision = 3L, updatedAt = 6_666L)
       submitAndAwait(coordB) { SessionCommand.ConsolidateNote(ackDeferred = it) }
 
+      var injectedFaultB = false
       h.draftRepo.onReplaceHook = { oldId, newInput ->
-        h.draftRepo.defaultReplace(oldId, newInput)
-        throw IOException("Queda após commit no SQLite")
+        val res = h.draftRepo.defaultReplace(oldId, newInput)
+        if (!injectedFaultB) {
+          injectedFaultB = true
+          throw IOException("Queda após commit no SQLite")
+        }
+        res
       }
       val callsBeforeB = h.draftRepo.replaceCount.get()
       val resB =
@@ -719,7 +724,54 @@ class NoteEditorSessionCoordinatorTest {
       testScheduler.runCurrent()
     }
 
-    // --- Casos C e E (coexistência e destino divergente -> anomalia sem sobrescrita) ---
+    // --- Caso C (ambos os checkpoints coexistem -> STATE_C anomalia sem sobrescrita nem exclusão) ---
+    val coordC =
+      h.createCoordinator(
+        openRequest = NoteEditorOpenRequest.OpenExisting(noteId = note.id, sessionId = "state-c"),
+        parentScope = this,
+        sessionIdProvider = { "state-c-new" },
+      )
+    try {
+      coordC.start()
+      testScheduler.runCurrent()
+      coordC.awaitInitialized()
+      submitMutation(coordC, SessionCommand.EditTitle("Draft C"))
+      assertEquals(SessionCommandOutcome.Completed, submitAndAwait(coordC) { SessionCommand.FlushAutosave(it) })
+      val oldDraftIdC = coordC.uiState.value.sessionIdentity!!.draftId
+      h.noteRepo.notes[note.id] = h.noteRepo.getNoteById(note.id)!!.copy(revision = 5L, updatedAt = 8_500L)
+      submitAndAwait(coordC) { SessionCommand.ConsolidateNote(ackDeferred = it) }
+
+      h.draftRepo.onReplaceHook = { oldId, newInput ->
+        val oldSnapshot = h.draftRepo.drafts[oldId]!!
+        h.draftRepo.defaultReplace(oldId, newInput)
+        // Mantém ambos presentes simultaneamente no banco (coexistência anômala Estado C).
+        h.draftRepo.drafts[oldId] = oldSnapshot
+        throw IOException("Estado C")
+      }
+      val newDraftIdC = NoteRecoveryDraftKeys.forNewNote("state-c-new")
+      val resC =
+        submitAndAwait(coordC) {
+          SessionCommand.ResolveConflict(ConflictResolutionOption.SAVE_DRAFT_AS_NEW_NOTE, it)
+        }
+      assertTrue(resC is SessionCommandOutcome.Failed)
+      val errC = coordC.uiState.value.autosaveStatus as AutosaveStatus.Error
+      assertTrue(errC.isTerminal)
+      assertTrue(errC.message.contains("coexistem"))
+      // Nenhum dos dois checkpoints foi sobrescrito ou excluído.
+      assertNotNull(h.draftRepo.getCheckpointById(oldDraftIdC))
+      assertNotNull(h.draftRepo.getCheckpointById(newDraftIdC))
+      assertEquals("Draft C", h.draftRepo.getCheckpointById(newDraftIdC)?.title)
+      assertNull(h.handoffTracker.findActiveCandidate(oldDraftIdC))
+      assertEquals(0, h.handoffTracker.snapshot().pendingCount)
+      assertTrue(h.registry.isSessionReserved("state-c"))
+      assertFalse(h.registry.isSessionReserved("state-c-new"))
+    } finally {
+      coordC.closeAndAbort()
+      testScheduler.runCurrent()
+    }
+    assertEquals(0, h.registry.snapshot().reservedSessionIds.size)
+
+    // --- Caso E (destino divergente -> STATE_E anomalia sem sobrescrita) ---
     val coordE =
       h.createCoordinator(
         openRequest = NoteEditorOpenRequest.OpenExisting(noteId = note.id, sessionId = "state-e"),
@@ -732,27 +784,37 @@ class NoteEditorSessionCoordinatorTest {
       coordE.awaitInitialized()
       submitMutation(coordE, SessionCommand.EditTitle("Draft E"))
       assertEquals(SessionCommandOutcome.Completed, submitAndAwait(coordE) { SessionCommand.FlushAutosave(it) })
-      h.noteRepo.notes[note.id] = h.noteRepo.getNoteById(note.id)!!.copy(revision = 5L, updatedAt = 8_888L)
+      val oldDraftIdE = coordE.uiState.value.sessionIdentity!!.draftId
+      h.noteRepo.notes[note.id] = h.noteRepo.getNoteById(note.id)!!.copy(revision = 6L, updatedAt = 8_888L)
       submitAndAwait(coordE) { SessionCommand.ConsolidateNote(ackDeferred = it) }
 
       h.draftRepo.onReplaceHook = { oldId, newInput ->
         h.draftRepo.defaultReplace(oldId, newInput.copy(title = "Adulterado"))
         throw IOException("Estado E")
       }
+      val newDraftIdE = NoteRecoveryDraftKeys.forNewNote("state-e-new")
       val resE =
         submitAndAwait(coordE) {
           SessionCommand.ResolveConflict(ConflictResolutionOption.SAVE_DRAFT_AS_NEW_NOTE, it)
         }
       assertTrue(resE is SessionCommandOutcome.Failed)
-      assertTrue((coordE.uiState.value.autosaveStatus as AutosaveStatus.Error).isTerminal)
+      val errE = coordE.uiState.value.autosaveStatus as AutosaveStatus.Error
+      assertTrue(errE.isTerminal)
+      assertTrue(errE.message.contains("diverge"))
+      assertNull(h.draftRepo.getCheckpointById(oldDraftIdE))
       assertEquals(
         "Adulterado",
-        h.draftRepo.getCheckpointById(NoteRecoveryDraftKeys.forNewNote("state-e-new"))?.title,
+        h.draftRepo.getCheckpointById(newDraftIdE)?.title,
       )
+      assertNull(h.handoffTracker.findActiveCandidate(oldDraftIdE))
+      assertEquals(0, h.handoffTracker.snapshot().pendingCount)
+      assertTrue(h.registry.isSessionReserved("state-e"))
+      assertFalse(h.registry.isSessionReserved("state-e-new"))
     } finally {
       coordE.closeAndAbort()
       testScheduler.runCurrent()
     }
+    assertEquals(0, h.registry.snapshot().reservedSessionIds.size)
 
     // --- Caso F (falha de leitura na reconciliação -> preserva PENDING no tracker & bloqueia ops) ---
     var nextIdToggle = 0
@@ -770,7 +832,7 @@ class NoteEditorSessionCoordinatorTest {
       assertEquals(SessionCommandOutcome.Completed, submitAndAwait(coordF) { SessionCommand.FlushAutosave(it) })
       val oldDraftIdF = coordF.uiState.value.sessionIdentity!!.draftId
 
-      h.noteRepo.notes[note.id] = h.noteRepo.getNoteById(note.id)!!.copy(revision = 6L, updatedAt = 9_999L)
+      h.noteRepo.notes[note.id] = h.noteRepo.getNoteById(note.id)!!.copy(revision = 7L, updatedAt = 9_999L)
       submitAndAwait(coordF) { SessionCommand.ConsolidateNote(ackDeferred = it) }
 
       h.draftRepo.onReplaceHook = { oldId, newInput ->
@@ -848,11 +910,16 @@ class NoteEditorSessionCoordinatorTest {
       h.noteRepo.notes[note.id] = note.copy(revision = 2L, updatedAt = 15_000L)
       submitAndAwait(coord) { SessionCommand.ConsolidateNote(ackDeferred = it) }
 
+      var injectedAbortFault = false
       h.draftRepo.onReplaceHook = { oldId, newInput ->
-        replaceStarted.complete(Unit)
-        releaseReplace.await()
+        if (!injectedAbortFault) {
+          injectedAbortFault = true
+          replaceStarted.complete(Unit)
+          releaseReplace.await()
+          h.draftRepo.defaultReplace(oldId, newInput)
+          throw IOException("Cancelamento concorrente simulado após commit")
+        }
         h.draftRepo.defaultReplace(oldId, newInput)
-        throw IOException("Cancelamento concorrente simulado após commit")
       }
 
       val resolveAck = CompletableDeferred<SessionCommandOutcome>()
@@ -939,6 +1006,7 @@ class NoteEditorSessionCoordinatorTest {
 
   private class TestNoteRepository(
     private val clock: ClockProvider,
+    private val draftRepo: TestDraftRepository,
   ) : NoteRepository {
     val notes = linkedMapOf<Long, Note>()
     private val nextId = AtomicLong(100L)
@@ -1023,6 +1091,9 @@ class NoteEditorSessionCoordinatorTest {
           updatedAt = clock.nowMillis(),
         )
       notes[id] = created
+      if (clearDraftId != null) {
+        draftRepo.drafts.remove(clearDraftId)
+      }
       return created
     }
 
@@ -1051,6 +1122,9 @@ class NoteEditorSessionCoordinatorTest {
           updatedAt = clock.nowMillis(),
         )
       notes[noteId] = updated
+      if (clearDraftId != null) {
+        draftRepo.drafts.remove(clearDraftId)
+      }
       return updated
     }
 

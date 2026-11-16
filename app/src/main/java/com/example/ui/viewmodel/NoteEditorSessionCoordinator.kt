@@ -76,6 +76,7 @@ class NoteEditorSessionCoordinator(
       handoffTracker = handoffTracker,
       replacementReconciler = replacementReconciler,
       sessionIdGenerator = sessionIdGenerator,
+      onLeaseCommitted = { newLease -> latestCommittedLease.set(newLease) },
     )
   private val shutdownCoordinator =
     SessionShutdownCoordinator(
@@ -96,6 +97,7 @@ class NoteEditorSessionCoordinator(
   private var engine: NoteEditorEngine? = null
   @Volatile private var executor: SingleFlightRoomPersistenceExecutor? = null
   private val uncommittedReplacement = AtomicReference<UncommittedReplacementContext?>(null)
+  private val latestCommittedLease = AtomicReference<SessionLeaseToken?>(null)
 
   private var nextOperationId: Long = 1L
   private var debounceJob: Job? = null
@@ -183,13 +185,16 @@ class NoteEditorSessionCoordinator(
           pendingBarrierProvider = { pendingBarrier },
           clearPendingBarrier = { pendingBarrier = null },
           uncommittedReplacement = uncommittedReplacement,
+          latestCommittedLease = latestCommittedLease,
           cancelDebounce = ::cancelDebounce,
           publishState = { rtState, engState -> publishCurrentRuntimeState(rtState, engState) },
           failFlushWaiters = ::failFlushWaitersUpTo,
         )
+        structuralOutcomes.clear()
         if (!initializedDeferred.isCompleted) {
           initializedDeferred.complete(mailbox.uiState.value)
         }
+        scope.cancel()
         terminatedDeferred.complete(Unit)
       }
     }
@@ -298,6 +303,7 @@ class NoteEditorSessionCoordinator(
         runtime = rt
         engine = initialEngine
         executor = exec
+        latestCommittedLease.set(openResult.lease)
 
         val published = publishCurrentRuntimeState(rt, initialEngine)
         if (needsInitialFallbackSave && rt.activeConflict == null) {
@@ -976,6 +982,7 @@ class NoteEditorSessionCoordinator(
         rt.knownFolderAvailability.putAll(data.resolvedFolderAvailability)
         rt.identity = data.newIdentity
         rt.lease = data.newLease
+        latestCommittedLease.set(data.newLease)
         executor = data.newExecutor
         updateConsolidatedExistingBaseline(rt, note, noteDoc, isNewTransition = true)
       }
@@ -1078,6 +1085,7 @@ class NoteEditorSessionCoordinator(
           is ReplacementReconciliationResult.RevertedToOld -> {
             executor = rec.restoredExecutor ?: executor
             rt.lease = rec.preservedLease
+            latestCommittedLease.set(rec.preservedLease)
             rt.errorMessage = failure?.message
             rt.autosaveStatus = AutosaveStatus.HeldPendingResolution
           }
@@ -1086,8 +1094,9 @@ class NoteEditorSessionCoordinator(
             rt.autosaveStatus = AutosaveStatus.Error(message = rec.message, isTerminal = false)
           }
           is ReplacementReconciliationResult.NeitherPresent -> {
-            rt.errorMessage = rec.message
-            rt.autosaveStatus = AutosaveStatus.Error(message = rec.message, isTerminal = true)
+            val msg = failure?.message?.takeIf { it.isNotBlank() } ?: rec.message
+            rt.errorMessage = msg
+            rt.autosaveStatus = AutosaveStatus.Error(message = msg, isTerminal = true)
           }
           is ReplacementReconciliationResult.DivergentAnomaly -> {
             rt.errorMessage = rec.message
@@ -1149,7 +1158,7 @@ class NoteEditorSessionCoordinator(
       rt.folderContext.copy(
         effectiveTarget = resolvedFolderAvail,
         fallbackSource = null,
-        initialBaseline = if (isNewTransition) null else rt.folderContext.initialBaseline,
+        initialBaseline = resolvedFolderAvail,
         existingNoteFolder = resolvedFolderAvail,
       )
     rt.effectiveFolderName =
@@ -1207,7 +1216,7 @@ class NoteEditorSessionCoordinator(
       ResolvedDraftFolderContext(
         effectiveTarget = existingFolderAvail,
         fallbackSource = null,
-        initialBaseline = null,
+        initialBaseline = existingFolderAvail,
         existingNoteFolder = existingFolderAvail,
       )
     val (resolvedSnap, resolvedCtx) =
@@ -1247,6 +1256,7 @@ class NoteEditorSessionCoordinator(
   ) {
     rt.identity = newIdentity
     rt.lease = newLease
+    latestCommittedLease.set(newLease)
     rt.baseline = newBaseline
     rt.persistedInitialFolderId = newDraft.initialFolderId
     rt.persistedInitialPaperStyle = newDraft.initialPaperStyle

@@ -226,6 +226,7 @@ internal class SessionShutdownCoordinator(
     pendingBarrierProvider: () -> PendingStructuralBarrier?,
     clearPendingBarrier: () -> Unit,
     uncommittedReplacement: AtomicReference<UncommittedReplacementContext?>,
+    latestCommittedLease: AtomicReference<SessionLeaseToken?>,
     cancelDebounce: () -> Unit,
     publishState: (SessionRuntimeState, NoteEditorEngine) -> NoteEditorUiState,
     failFlushWaiters: (Long, String, Throwable?) -> Unit,
@@ -240,6 +241,12 @@ internal class SessionShutdownCoordinator(
         currentOp.job.join()
       }
       clearInFlightOp()
+    }
+
+    if (rt != null) {
+      latestCommittedLease.get()?.let { committedLease ->
+        rt.lease = committedLease
+      }
     }
 
     val pendingCtx = uncommittedReplacement.get()
@@ -259,10 +266,12 @@ internal class SessionShutdownCoordinator(
         when (rec) {
           is ReplacementReconciliationResult.PromotedToNew -> {
             rt.lease = rec.newLease
+            latestCommittedLease.set(rec.newLease)
             uncommittedReplacement.set(null)
           }
           is ReplacementReconciliationResult.RevertedToOld -> {
             rt.lease = rec.preservedLease
+            latestCommittedLease.set(rec.preservedLease)
             uncommittedReplacement.set(null)
           }
           is ReplacementReconciliationResult.NeitherPresent,
@@ -289,6 +298,9 @@ internal class SessionShutdownCoordinator(
     failFlushWaiters(Long.MAX_VALUE, "Sessão encerrada.", null)
 
     if (rt != null) {
+      latestCommittedLease.get()?.let { committedLease ->
+        rt.lease = committedLease
+      }
       rt.isConsolidating = false
       rt.isSessionTerminated = true
       if (eng != null) {

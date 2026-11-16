@@ -36,6 +36,7 @@ internal class SessionStructuralRunner(
   private val handoffTracker: ReplacementHandoffTracker,
   private val replacementReconciler: PendingReplacementReconciler,
   private val sessionIdGenerator: () -> String,
+  private val onLeaseCommitted: (SessionLeaseToken) -> Unit = {},
 ) {
   suspend fun runConsolidateNote(
     command: SessionCommand.ConsolidateNote,
@@ -152,6 +153,7 @@ internal class SessionStructuralRunner(
                   IllegalStateException("Falha ao confirmar transferência pós-criação: $commitRes")
                 )
             }
+          onLeaseCommitted(newLease)
           val newExecutor =
             SingleFlightRoomPersistenceExecutor(
               draftRepository = draftRepository,
@@ -521,6 +523,7 @@ internal class SessionStructuralRunner(
       val savedDraft = savedDraftOrNull
       return when (val commitRes = activeSessionRegistry.commitIdentityTransfer(transferToken)) {
         is CommitTransferResult.Committed -> {
+          onLeaseCommitted(commitRes.newLease)
           handoffTracker.markResolved(runtimeSnapshot.identity.draftId, handoffRecord.handoffId)
           onPendingReplacementSet(null)
           StructuralRunnerResult.Succeeded(
@@ -533,6 +536,7 @@ internal class SessionStructuralRunner(
           )
         }
         is CommitTransferResult.AlreadyCommitted -> {
+          onLeaseCommitted(commitRes.newLease)
           handoffTracker.markResolved(runtimeSnapshot.identity.draftId, handoffRecord.handoffId)
           onPendingReplacementSet(null)
           StructuralRunnerResult.Succeeded(
@@ -553,6 +557,9 @@ internal class SessionStructuralRunner(
               context = context,
               forShutdown = false,
             )
+          if (reconciled is ReplacementReconciliationResult.PromotedToNew) {
+            onLeaseCommitted(reconciled.newLease)
+          }
           StructuralRunnerResult.Failed(
             cause = IllegalStateException("Commit no Registry falhou após substituição no Room."),
             fallbackData = StructuralOutcomeData.ReconciledIndeterminate(reconciled),
@@ -601,6 +608,7 @@ internal class SessionStructuralRunner(
           )
         return when (reconciled) {
           is ReplacementReconciliationResult.PromotedToNew -> {
+            onLeaseCommitted(reconciled.newLease)
             onPendingReplacementSet(null)
             StructuralRunnerResult.Succeeded(
               StructuralOutcomeData.ReconciledIndeterminate(reconciled)

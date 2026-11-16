@@ -90,10 +90,10 @@ internal data class SessionRuntimeState(
     val hasInFlightWrite = isConsolidating || hasInFlightPersistence
     val resolvedStatus =
       when {
+        autosaveStatus is AutosaveStatus.Error -> autosaveStatus
         activeConflict != null -> AutosaveStatus.HeldPendingResolution
-        errorMessage != null || autosaveStatus is AutosaveStatus.Error ->
-          autosaveStatus as? AutosaveStatus.Error
-            ?: AutosaveStatus.Error(message = errorMessage ?: "Erro na sessão.", isTerminal = false)
+        errorMessage != null ->
+          AutosaveStatus.Error(message = errorMessage ?: "Erro na sessão.", isTerminal = false)
         hasInFlightWrite -> AutosaveStatus.Saving
         stateGeneration == lastSyncedGeneration && !evaluation.needsDraftRetention ->
           AutosaveStatus.Idle
