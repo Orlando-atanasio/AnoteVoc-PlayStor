@@ -261,9 +261,55 @@ class SingleFlightRoomPersistenceExecutorRoomIntegrationTest {
           targetNoteId = targetNote.id,
         )
 
+      val realDao = database.noteRecoveryDraftDao()
+      val insertedDraftIds = mutableListOf<String>()
+      val deleteRowCounts = mutableListOf<Pair<String, Int>>()
+      var totalDaoCalls = 0
+      val observedDao =
+        object : com.example.data.local.dao.NoteRecoveryDraftDao {
+          override fun observeAllCheckpoints() = realDao.observeAllCheckpoints()
+
+          override suspend fun getAllCheckpoints() =
+            realDao.getAllCheckpoints().also { totalDaoCalls++ }
+
+          override suspend fun getByDraftId(draftId: String) =
+            realDao.getByDraftId(draftId).also { totalDaoCalls++ }
+
+          override suspend fun getByTargetNoteId(noteId: Long) =
+            realDao.getByTargetNoteId(noteId).also { totalDaoCalls++ }
+
+          override suspend fun getBySessionId(sessionId: String) =
+            realDao.getBySessionId(sessionId).also { totalDaoCalls++ }
+
+          override suspend fun insert(entity: com.example.data.local.entity.NoteRecoveryDraftEntity) {
+            totalDaoCalls++
+            realDao.insert(entity)
+            insertedDraftIds.add(entity.draftId)
+          }
+
+          override suspend fun update(entity: com.example.data.local.entity.NoteRecoveryDraftEntity) =
+            realDao.update(entity).also { totalDaoCalls++ }
+
+          override suspend fun deleteByDraftId(draftId: String): Int {
+            totalDaoCalls++
+            val affected = realDao.deleteByDraftId(draftId)
+            deleteRowCounts.add(draftId to affected)
+            return affected
+          }
+
+          override suspend fun deleteByTargetNoteId(noteId: Long) =
+            realDao.deleteByTargetNoteId(noteId).also { totalDaoCalls++ }
+        }
+      val observedDraftRepository =
+        NoteRecoveryDraftRepositoryImpl(
+          database = database,
+          draftDao = observedDao,
+          dispatchers = testDispatchers,
+          clock = testClock,
+        )
       val executor =
         SingleFlightRoomPersistenceExecutor(
-          draftRepository = draftRepository,
+          draftRepository = observedDraftRepository,
           noteRepository = noteRepository,
           initialIdentity = oldIdentity,
           initialPresence = CheckpointPresence.ABSENT,
@@ -322,6 +368,8 @@ class SingleFlightRoomPersistenceExecutorRoomIntegrationTest {
         """.trimIndent()
       )
 
+      insertedDraftIds.clear()
+      deleteRowCounts.clear()
       try {
         val rejected =
           executor.replaceCheckpointWithNewNote(
@@ -335,6 +383,9 @@ class SingleFlightRoomPersistenceExecutorRoomIntegrationTest {
         assertTrue(rejected is ReplaceCheckpointExecutionResult.Failed)
         val failed = rejected as ReplaceCheckpointExecutionResult.Failed
         assertTrue(failed.cause is InvalidRecoveryDraftException)
+        assertTrue(failed.cause.message?.contains("Falha ao excluir o rascunho anterior") == true)
+        assertEquals(listOf(newIdentity.draftId), insertedDraftIds)
+        assertEquals(listOf(oldIdentity.draftId to 0), deleteRowCounts)
         assertNull(failed.snapshot.pendingReplacement)
         assertFalse(failed.snapshot.hasPendingReplacement)
         assertFalse(failed.snapshot.hasInFlightOperation)
@@ -345,17 +396,24 @@ class SingleFlightRoomPersistenceExecutorRoomIntegrationTest {
         assertFalse(failed.snapshot.isSyncConfirmationAllowed)
 
         // Rollback integral no Room real: novo registro desfeito e antigo preservado.
-        assertNull(database.noteRecoveryDraftDao().getByDraftId(newIdentity.draftId))
-        val intactOld = database.noteRecoveryDraftDao().getByDraftId(oldIdentity.draftId)
+        assertNull(realDao.getByDraftId(newIdentity.draftId))
+        val intactOld = realDao.getByDraftId(oldIdentity.draftId)
         assertNotNull(intactOld)
         assertEquals("Rascunho antigo v1 post-insert", intactOld!!.title)
         assertEquals(1L, intactOld.checkpointRevision)
-        assertEquals(1, database.noteRecoveryDraftDao().getAllCheckpoints().size)
+        assertEquals(1, realDao.getAllCheckpoints().size)
       } finally {
         writableDb.execSQL("DROP TRIGGER IF EXISTS ignore_delete_room_integration")
       }
 
-      // Enquanto UNKNOWN, operações incompatíveis (identidade nova ou createNote na identidade antiga) são rejeitadas sem mutar banco.
+      // Enquanto UNKNOWN, operações incompatíveis (identidade nova ou createNote na identidade antiga) são rejeitadas sem tocar o banco/repositório.
+      fun countNotesInDb(): Int =
+        database.openHelper.readableDatabase.query("SELECT COUNT(*) FROM notes").use { cursor ->
+          if (cursor.moveToFirst()) cursor.getInt(0) else 0
+        }
+
+      val daoCallsBeforeIncompatible = totalDaoCalls
+      val notesBeforeIncompatible = countNotesInDb()
       try {
         executor.saveCheckpoint(
           CheckpointSavePayload.fromIdentity(
@@ -372,7 +430,8 @@ class SingleFlightRoomPersistenceExecutorRoomIntegrationTest {
         )
         fail("Esperava IllegalArgumentException para payload com newIdentity após rejeição")
       } catch (_: IllegalArgumentException) {
-        assertNull(database.noteRecoveryDraftDao().getByDraftId(newIdentity.draftId))
+        assertEquals(daoCallsBeforeIncompatible, totalDaoCalls)
+        assertNull(realDao.getByDraftId(newIdentity.draftId))
         assertFalse(executor.snapshot().isSyncConfirmationAllowed)
       }
 
@@ -386,6 +445,8 @@ class SingleFlightRoomPersistenceExecutorRoomIntegrationTest {
         )
         fail("Esperava IllegalArgumentException para consolidateCreateNote em sessão com targetNoteId != null")
       } catch (_: IllegalArgumentException) {
+        assertEquals(daoCallsBeforeIncompatible, totalDaoCalls)
+        assertEquals(notesBeforeIncompatible, countNotesInDb())
         assertFalse(executor.snapshot().isSyncConfirmationAllowed)
       }
 

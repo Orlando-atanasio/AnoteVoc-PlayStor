@@ -975,8 +975,51 @@ class NoteRecoveryDraftReplaceTransactionTest {
           checkpointRevision = 1L,
         )
 
+      // DAO observador pass-through sobre o DAO real do Room para comprovar empiricamente que:
+      // (a) insert(newEntity) executa e fica visível dentro da transação antes do DELETE, e
+      // (b) deleteByDraftId(oldDraftId) realmente retorna 0 linhas afetadas sob RAISE(IGNORE).
+      val realDao = database.noteRecoveryDraftDao()
+      val insertedDraftIds = mutableListOf<String>()
+      var sawNewDraftBeforeDeleteInTx = false
+      val deleteRowCounts = mutableListOf<Pair<String, Int>>()
+      val observedDao =
+        object : com.example.data.local.dao.NoteRecoveryDraftDao {
+          override fun observeAllCheckpoints() = realDao.observeAllCheckpoints()
+
+          override suspend fun getAllCheckpoints() = realDao.getAllCheckpoints()
+
+          override suspend fun getByDraftId(draftId: String) = realDao.getByDraftId(draftId)
+
+          override suspend fun getByTargetNoteId(noteId: Long) = realDao.getByTargetNoteId(noteId)
+
+          override suspend fun getBySessionId(sessionId: String) = realDao.getBySessionId(sessionId)
+
+          override suspend fun insert(entity: NoteRecoveryDraftEntity) {
+            realDao.insert(entity)
+            insertedDraftIds.add(entity.draftId)
+          }
+
+          override suspend fun update(entity: NoteRecoveryDraftEntity) = realDao.update(entity)
+
+          override suspend fun deleteByDraftId(draftId: String): Int {
+            sawNewDraftBeforeDeleteInTx = realDao.getByDraftId(newDraftId) != null
+            val affected = realDao.deleteByDraftId(draftId)
+            deleteRowCounts.add(draftId to affected)
+            return affected
+          }
+
+          override suspend fun deleteByTargetNoteId(noteId: Long) = realDao.deleteByTargetNoteId(noteId)
+        }
+      val observedDraftRepository =
+        NoteRecoveryDraftRepositoryImpl(
+          database = database,
+          draftDao = observedDao,
+          dispatchers = testDispatchers,
+          clock = testClock,
+        )
+
       try {
-        draftRepository.replaceCheckpointWithNewNote(
+        observedDraftRepository.replaceCheckpointWithNewNote(
           oldDraftId = oldDraftId,
           expectedOldSessionId = oldSessionId,
           expectedOldTargetNoteId = note.id,
@@ -986,22 +1029,26 @@ class NoteRecoveryDraftReplaceTransactionTest {
           "Esperava InvalidRecoveryDraftException após deleteByDraftId retornar 0 linhas com RAISE(IGNORE)"
         )
       } catch (e: InvalidRecoveryDraftException) {
+        assertEquals(listOf(newDraftId), insertedDraftIds)
+        assertTrue(sawNewDraftBeforeDeleteInTx)
+        assertEquals(listOf(oldDraftId to 0), deleteRowCounts)
+        assertTrue(e.message?.contains("Falha ao excluir o rascunho anterior") == true)
         assertTrue(e.message?.contains(oldDraftId) == true)
 
         // O INSERT já ocorrera antes do DELETE; o rollback do Room deve desfazer o novo registro.
-        assertNull(database.noteRecoveryDraftDao().getByDraftId(newDraftId))
-        assertNull(database.noteRecoveryDraftDao().getBySessionId(newSessionId))
+        assertNull(realDao.getByDraftId(newDraftId))
+        assertNull(realDao.getBySessionId(newSessionId))
 
         // O rascunho antigo e o irmão permanecem íntegros e sem coexistência indevida.
-        val oldAfter = database.noteRecoveryDraftDao().getByDraftId(oldDraftId)
+        val oldAfter = realDao.getByDraftId(oldDraftId)
         assertNotNull(oldAfter)
         assertEquals(oldBefore, oldAfter)
 
-        val siblingAfter = database.noteRecoveryDraftDao().getByDraftId(siblingDraftId)
+        val siblingAfter = realDao.getByDraftId(siblingDraftId)
         assertNotNull(siblingAfter)
         assertEquals("Irmão intacto", siblingAfter!!.title)
 
-        assertEquals(2, database.noteRecoveryDraftDao().getAllCheckpoints().size)
+        assertEquals(2, realDao.getAllCheckpoints().size)
       } finally {
         writableDb.execSQL("DROP TRIGGER IF EXISTS ignore_delete_old_draft")
       }

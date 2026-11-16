@@ -2285,6 +2285,119 @@ class SingleFlightRoomPersistenceExecutorTest {
       assertEquals(1, draftRepo.maxConcurrentCalls.get())
     }
 
+  @Test
+  fun cancellationOfInFlightHolderWhileQueuedOperationAwaits_releasesMutexAndAllowsSafeRecovery() =
+    runBlocking {
+      // Caso 1: saveCheckpoint em voo cancelado enquanto outro saveCheckpoint aguarda na fila FIFO.
+      val draftRepo1 = FakeDraftRepository()
+      val noteRepo1 = FakeNoteRepository()
+      val identity1 = newNoteIdentity("cancel-holder-save")
+      val exec1 =
+        SingleFlightRoomPersistenceExecutor(
+          draftRepository = draftRepo1,
+          noteRepository = noteRepo1,
+          initialIdentity = identity1,
+          initialPresence = CheckpointPresence.ABSENT,
+        )
+
+      val op1Entered = CompletableDeferred<Unit>()
+      val op1Gate = CompletableDeferred<Unit>()
+      draftRepo1.onSaveHook = { input ->
+        if (input.title == "holder-cancelled") {
+          op1Entered.complete(Unit)
+          op1Gate.await()
+        }
+      }
+
+      val holderSave =
+        async(Dispatchers.Default) {
+          exec1.saveCheckpoint(payloadFor(identity1, title = "holder-cancelled"))
+        }
+      withTimeout(5_000) { op1Entered.await() }
+
+      val queuedSave =
+        async(start = CoroutineStart.UNDISPATCHED) {
+          exec1.saveCheckpoint(payloadFor(identity1, title = "queued-follower"))
+        }
+
+      holderSave.cancelAndJoin()
+      assertTrue(holderSave.isCancelled)
+
+      val queuedResult = withTimeout(5_000) { queuedSave.await() }
+      assertTrue(queuedResult is SaveCheckpointExecutionResult.Saved)
+      val savedFollower = queuedResult as SaveCheckpointExecutionResult.Saved
+      // Revisão 1 foi alocada antes da suspensão da operação cancelada; a seguidora avança para 2 e reconcilia UNKNOWN.
+      assertEquals(2L, savedFollower.allocatedRevision)
+      assertEquals(CheckpointPresence.PRESENT, savedFollower.snapshot.checkpointPresence)
+      assertFalse(savedFollower.snapshot.hasInFlightOperation)
+      assertTrue(draftRepo1.callLog.contains("getCheckpointById:${identity1.draftId}"))
+      assertEquals(1, draftRepo1.maxConcurrentCalls.get())
+
+      // Caso 2: replaceCheckpointWithNewNote em voo cancelado enquanto saveCheckpoint aguarda na fila FIFO.
+      val draftRepo2 = FakeDraftRepository()
+      val noteRepo2 = FakeNoteRepository()
+      val oldIdentity = existingNoteIdentity(noteId = 65L, sessionId = "old-65")
+      val newIdentity = newNoteIdentity("new-65")
+      draftRepo2.seedDraft(oldIdentity.draftId, oldIdentity.sessionId, 65L, "original-65", 2L)
+
+      val exec2 =
+        SingleFlightRoomPersistenceExecutor(
+          draftRepository = draftRepo2,
+          noteRepository = noteRepo2,
+          initialIdentity = oldIdentity,
+          initialPresence = CheckpointPresence.PRESENT,
+          initialConfirmedRevision = 2L,
+        )
+
+      val replaceEntered = CompletableDeferred<Unit>()
+      val replaceGate = CompletableDeferred<Unit>()
+      draftRepo2.onReplaceHook = {
+        replaceEntered.complete(Unit)
+        replaceGate.await()
+      }
+
+      val newPayload = payloadFor(newIdentity, title = "replace-65", baseRevision = 0L, baseNoteUpdatedAt = null)
+      val holderReplace =
+        async(Dispatchers.Default) {
+          exec2.replaceCheckpointWithNewNote(
+            oldDraftId = oldIdentity.draftId,
+            expectedOldSessionId = oldIdentity.sessionId,
+            expectedOldTargetNoteId = 65L,
+            newPayload = newPayload,
+          )
+        }
+      withTimeout(5_000) { replaceEntered.await() }
+
+      val queuedBlockedSave =
+        async(start = CoroutineStart.UNDISPATCHED) {
+          exec2.saveCheckpoint(payloadFor(oldIdentity, title = "queued-blocked-after-cancel"))
+        }
+
+      holderReplace.cancelAndJoin()
+      assertTrue(holderReplace.isCancelled)
+
+      val blockedRes = withTimeout(5_000) { queuedBlockedSave.await() }
+      assertTrue(blockedRes is SaveCheckpointExecutionResult.Failed)
+      assertTrue(blockedRes.snapshot.hasPendingReplacement)
+      assertEquals(CheckpointPresence.UNKNOWN, blockedRes.snapshot.checkpointPresence)
+      assertFalse(blockedRes.snapshot.hasInFlightOperation)
+      assertFalse(draftRepo2.callLog.any { it.startsWith("saveCheckpoint:") })
+      assertEquals(1, draftRepo2.maxConcurrentCalls.get())
+
+      // Repetição idêntica após destravamento conclui a substituição normalmente.
+      draftRepo2.onReplaceHook = null
+      val resolved =
+        exec2.replaceCheckpointWithNewNote(
+          oldDraftId = oldIdentity.draftId,
+          expectedOldSessionId = oldIdentity.sessionId,
+          expectedOldTargetNoteId = 65L,
+          newPayload = newPayload,
+        )
+      assertTrue(resolved is ReplaceCheckpointExecutionResult.Replaced)
+      assertFalse(resolved.snapshot.hasPendingReplacement)
+      assertEquals(newIdentity.draftId, resolved.snapshot.draftId)
+    }
+
   private class FakeDraftRepository : NoteRecoveryDraftRepository {
     private val store = LinkedHashMap<String, NoteRecoveryDraft>()
     private val concurrentCalls = AtomicInteger(0)
