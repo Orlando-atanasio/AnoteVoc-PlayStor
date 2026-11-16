@@ -245,4 +245,116 @@ class NoteEditorUiStateTest {
     assertTrue(legacyUi.hasEditableUnsavedChanges)
     assertTrue(legacyUi.canConsolidateNow)
   }
+
+  @Test
+  fun isSessionFullySynced_rejectsPendingSavingHeldErrorConsolidatingAndIncoherentSavedGeneration() {
+    val baseSynced =
+      NoteEditorUiState(
+        phase = NoteEditorSessionPhase.EDITING,
+        stateGeneration = 4L,
+        lastSyncedGeneration = 4L,
+        autosaveStatus = AutosaveStatus.Saved(syncedGeneration = 4L, checkpointAt = 1000L),
+        isConsolidating = false,
+      )
+    assertTrue(baseSynced.isSessionFullySynced)
+
+    // Idle com gerações alinhadas em EDITING sem consolidação também está sincronizado
+    assertTrue(
+      NoteEditorUiState(
+        phase = NoteEditorSessionPhase.EDITING,
+        stateGeneration = 0L,
+        lastSyncedGeneration = 0L,
+        autosaveStatus = AutosaveStatus.Idle,
+        isConsolidating = false,
+      ).isSessionFullySynced
+    )
+
+    // Fases não editáveis nunca indicam sincronização completa
+    assertFalse(baseSynced.copy(phase = NoteEditorSessionPhase.LOADING).isSessionFullySynced)
+    assertFalse(baseSynced.copy(phase = NoteEditorSessionPhase.BLOCKED).isSessionFullySynced)
+    assertFalse(baseSynced.copy(phase = NoteEditorSessionPhase.ERROR).isSessionFullySynced)
+
+    // Divergência de gerações
+    assertFalse(baseSynced.copy(stateGeneration = 5L).isSessionFullySynced)
+
+    // Estados de autosave pendentes, em execução, retidos ou em erro
+    assertFalse(baseSynced.copy(autosaveStatus = AutosaveStatus.PendingDebounce).isSessionFullySynced)
+    assertFalse(baseSynced.copy(autosaveStatus = AutosaveStatus.Saving).isSessionFullySynced)
+    assertFalse(
+      baseSynced.copy(autosaveStatus = AutosaveStatus.HeldPendingResolution).isSessionFullySynced
+    )
+    assertFalse(
+      baseSynced.copy(autosaveStatus = AutosaveStatus.Error("Erro", isTerminal = false)).isSessionFullySynced
+    )
+
+    // Consolidação em curso
+    assertFalse(baseSynced.copy(isConsolidating = true).isSessionFullySynced)
+
+    // Falso positivo evitado: Saved com syncedGeneration incoerente em relação a lastSyncedGeneration
+    assertFalse(
+      baseSynced
+        .copy(autosaveStatus = AutosaveStatus.Saved(syncedGeneration = 3L, checkpointAt = 900L))
+        .isSessionFullySynced
+    )
+  }
+
+  @Test
+  fun defensiveCopies_inNoteEditorUiState_isolateWarningsAndEditorStateCollections() {
+    val mutableSpans =
+      mutableListOf(
+        com.example.domain.model.FormatSpan(0, 3, com.example.domain.model.TextFormatStyle.BOLD)
+      )
+    val mutableBlocks =
+      mutableListOf<com.example.domain.model.ContentBlock>(
+        com.example.domain.model.ParagraphBlock(id = "p1", text = "Olá", spans = mutableSpans)
+      )
+    val mutableStyles = mutableSetOf(com.example.domain.model.TextFormatStyle.BOLD)
+    val mutableNumbers = mutableMapOf("n1" to 1)
+    val mutableWarnings =
+      mutableListOf<SessionWarning>(SessionWarning.CurrentDestinationUnknown(77L))
+
+    val uiState =
+      NoteEditorUiState(
+        phase = NoteEditorSessionPhase.EDITING,
+        editorState =
+          NoteEditorState(
+            document = NoteContentDocument(blocks = mutableBlocks),
+            selection = null,
+            activeTypingStyles = mutableStyles,
+            numberedListNumbers = mutableNumbers,
+          ),
+        warnings = mutableWarnings,
+      )
+    val copiedState = uiState.copy(title = "Copiado")
+
+    // Mutação posterior das coleções mutáveis fornecidas pelo chamador
+    mutableSpans.clear()
+    mutableBlocks.clear()
+    mutableStyles.add(com.example.domain.model.TextFormatStyle.ITALIC)
+    mutableNumbers["n2"] = 2
+    mutableWarnings.clear()
+
+    assertEquals(1, uiState.editorState.document.blocks.size)
+    assertEquals(1, uiState.editorState.document.blocks[0].spans.size)
+    assertEquals(setOf(com.example.domain.model.TextFormatStyle.BOLD), uiState.editorState.activeTypingStyles)
+    assertEquals(mapOf("n1" to 1), uiState.editorState.numberedListNumbers)
+    assertEquals(1, uiState.warnings.size)
+    assertEquals(1, copiedState.warnings.size)
+    assertEquals(1, copiedState.editorState.document.blocks.size)
+
+    org.junit.Assert.assertThrows(UnsupportedOperationException::class.java) {
+      @Suppress("UNCHECKED_CAST")
+      (uiState.warnings as MutableList<SessionWarning>).add(
+        SessionWarning.LegacyDraftIndeterminateBaseline("new_z")
+      )
+    }
+    org.junit.Assert.assertThrows(UnsupportedOperationException::class.java) {
+      @Suppress("UNCHECKED_CAST")
+      (uiState.editorState.activeTypingStyles as MutableSet<com.example.domain.model.TextFormatStyle>).clear()
+    }
+    org.junit.Assert.assertThrows(UnsupportedOperationException::class.java) {
+      @Suppress("UNCHECKED_CAST")
+      (uiState.editorState.numberedListNumbers as MutableMap<String, Int>).clear()
+    }
+  }
 }

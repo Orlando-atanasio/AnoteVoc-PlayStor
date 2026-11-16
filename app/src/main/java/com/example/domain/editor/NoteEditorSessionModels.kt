@@ -1,10 +1,45 @@
 package com.example.domain.editor
 
+import com.example.domain.model.BulletListItemBlock
+import com.example.domain.model.ChecklistItemBlock
+import com.example.domain.model.ContentBlock
 import com.example.domain.model.Folder
 import com.example.domain.model.NoteContentDocument
 import com.example.domain.model.NoteContentState
 import com.example.domain.model.NotePaperStyle
 import com.example.domain.model.NoteRecoveryDraftKeys
+import com.example.domain.model.NumberedListItemBlock
+import com.example.domain.model.ParagraphBlock
+import java.util.Collections
+
+/**
+ * Cria cópia defensiva profunda de [NoteContentDocument] com listas não modificáveis
+ * para impedir mutação externa posterior nos limites da camada de sessão.
+ */
+internal fun NoteContentDocument.toImmutableSnapshot(): NoteContentDocument =
+  NoteContentDocument(
+    schemaVersion = schemaVersion,
+    blocks = Collections.unmodifiableList(blocks.map { block -> block.toImmutableSnapshot() }),
+  )
+
+internal fun ContentBlock.toImmutableSnapshot(): ContentBlock =
+  when (this) {
+    is ParagraphBlock ->
+      copy(spans = Collections.unmodifiableList(spans.toList()))
+    is BulletListItemBlock ->
+      copy(spans = Collections.unmodifiableList(spans.toList()))
+    is NumberedListItemBlock ->
+      copy(spans = Collections.unmodifiableList(spans.toList()))
+    is ChecklistItemBlock ->
+      copy(spans = Collections.unmodifiableList(spans.toList()))
+  }
+
+internal fun NoteEditorState.toImmutableSnapshot(): NoteEditorState =
+  copy(
+    document = document.toImmutableSnapshot(),
+    activeTypingStyles = Collections.unmodifiableSet(activeTypingStyles.toSet()),
+    numberedListNumbers = Collections.unmodifiableMap(numberedListNumbers.toMap()),
+  )
 
 /**
  * Expectativa declarada pelo fluxo de abertura ao recuperar um checkpoint persistido.
@@ -137,19 +172,74 @@ data class ResolvedDraftFolderContext(
  * Baseline estático da sessão contra o qual o estado editável é comparado.
  */
 sealed interface NoteEditorBaseline {
-  data class NewNote(
+  class NewNote private constructor(
     val title: String,
     val normalizedContent: NoteContentDocument,
     val paperStyle: NotePaperStyle,
     val staticFolderId: Long?,
     val initialIsPinned: Boolean,
-  ) : NoteEditorBaseline
+  ) : NoteEditorBaseline {
+    fun copy(
+      title: String = this.title,
+      normalizedContent: NoteContentDocument = this.normalizedContent,
+      paperStyle: NotePaperStyle = this.paperStyle,
+      staticFolderId: Long? = this.staticFolderId,
+      initialIsPinned: Boolean = this.initialIsPinned,
+    ): NewNote =
+      invoke(
+        title = title,
+        normalizedContent = normalizedContent,
+        paperStyle = paperStyle,
+        staticFolderId = staticFolderId,
+        initialIsPinned = initialIsPinned,
+      )
+
+    override fun equals(other: Any?): Boolean {
+      if (this === other) return true
+      if (other !is NewNote) return false
+      return title == other.title &&
+        normalizedContent == other.normalizedContent &&
+        paperStyle == other.paperStyle &&
+        staticFolderId == other.staticFolderId &&
+        initialIsPinned == other.initialIsPinned
+    }
+
+    override fun hashCode(): Int {
+      var result = title.hashCode()
+      result = 31 * result + normalizedContent.hashCode()
+      result = 31 * result + paperStyle.hashCode()
+      result = 31 * result + (staticFolderId?.hashCode() ?: 0)
+      result = 31 * result + initialIsPinned.hashCode()
+      return result
+    }
+
+    override fun toString(): String =
+      "NewNote(title=$title, normalizedContent=$normalizedContent, paperStyle=$paperStyle, " +
+        "staticFolderId=$staticFolderId, initialIsPinned=$initialIsPinned)"
+
+    companion object {
+      operator fun invoke(
+        title: String,
+        normalizedContent: NoteContentDocument,
+        paperStyle: NotePaperStyle,
+        staticFolderId: Long?,
+        initialIsPinned: Boolean,
+      ): NewNote =
+        NewNote(
+          title = title,
+          normalizedContent = normalizedContent.toImmutableSnapshot(),
+          paperStyle = paperStyle,
+          staticFolderId = staticFolderId,
+          initialIsPinned = initialIsPinned,
+        )
+    }
+  }
 
   data class LegacyIndeterminate(
     val draftId: String,
   ) : NoteEditorBaseline
 
-  data class ExistingNote(
+  class ExistingNote private constructor(
     val noteId: Long,
     val baseRevision: Long,
     val baseNoteUpdatedAt: Long,
@@ -158,7 +248,81 @@ sealed interface NoteEditorBaseline {
     val paperStyle: NotePaperStyle,
     val staticFolderId: Long?,
     val currentDbIsPinned: Boolean,
-  ) : NoteEditorBaseline
+  ) : NoteEditorBaseline {
+    fun copy(
+      noteId: Long = this.noteId,
+      baseRevision: Long = this.baseRevision,
+      baseNoteUpdatedAt: Long = this.baseNoteUpdatedAt,
+      title: String = this.title,
+      normalizedContent: NoteContentDocument = this.normalizedContent,
+      paperStyle: NotePaperStyle = this.paperStyle,
+      staticFolderId: Long? = this.staticFolderId,
+      currentDbIsPinned: Boolean = this.currentDbIsPinned,
+    ): ExistingNote =
+      invoke(
+        noteId = noteId,
+        baseRevision = baseRevision,
+        baseNoteUpdatedAt = baseNoteUpdatedAt,
+        title = title,
+        normalizedContent = normalizedContent,
+        paperStyle = paperStyle,
+        staticFolderId = staticFolderId,
+        currentDbIsPinned = currentDbIsPinned,
+      )
+
+    override fun equals(other: Any?): Boolean {
+      if (this === other) return true
+      if (other !is ExistingNote) return false
+      return noteId == other.noteId &&
+        baseRevision == other.baseRevision &&
+        baseNoteUpdatedAt == other.baseNoteUpdatedAt &&
+        title == other.title &&
+        normalizedContent == other.normalizedContent &&
+        paperStyle == other.paperStyle &&
+        staticFolderId == other.staticFolderId &&
+        currentDbIsPinned == other.currentDbIsPinned
+    }
+
+    override fun hashCode(): Int {
+      var result = noteId.hashCode()
+      result = 31 * result + baseRevision.hashCode()
+      result = 31 * result + baseNoteUpdatedAt.hashCode()
+      result = 31 * result + title.hashCode()
+      result = 31 * result + normalizedContent.hashCode()
+      result = 31 * result + paperStyle.hashCode()
+      result = 31 * result + (staticFolderId?.hashCode() ?: 0)
+      result = 31 * result + currentDbIsPinned.hashCode()
+      return result
+    }
+
+    override fun toString(): String =
+      "ExistingNote(noteId=$noteId, baseRevision=$baseRevision, baseNoteUpdatedAt=$baseNoteUpdatedAt, " +
+        "title=$title, normalizedContent=$normalizedContent, paperStyle=$paperStyle, " +
+        "staticFolderId=$staticFolderId, currentDbIsPinned=$currentDbIsPinned)"
+
+    companion object {
+      operator fun invoke(
+        noteId: Long,
+        baseRevision: Long,
+        baseNoteUpdatedAt: Long,
+        title: String,
+        normalizedContent: NoteContentDocument,
+        paperStyle: NotePaperStyle,
+        staticFolderId: Long?,
+        currentDbIsPinned: Boolean,
+      ): ExistingNote =
+        ExistingNote(
+          noteId = noteId,
+          baseRevision = baseRevision,
+          baseNoteUpdatedAt = baseNoteUpdatedAt,
+          title = title,
+          normalizedContent = normalizedContent.toImmutableSnapshot(),
+          paperStyle = paperStyle,
+          staticFolderId = staticFolderId,
+          currentDbIsPinned = currentDbIsPinned,
+        )
+    }
+  }
 }
 
 /**
@@ -196,6 +360,11 @@ enum class ConflictResolutionOption {
  */
 sealed interface SessionBlockReason {
   data class DraftNotFound(val draftId: String) : SessionBlockReason
+
+  data class DraftIdentityMismatch(
+    val requestedDraftId: String,
+    val providedDraftId: String,
+  ) : SessionBlockReason
 
   data class DraftTargetMismatch(
     val draftId: String,
@@ -276,9 +445,9 @@ sealed interface ConsolidationReadiness {
 }
 
 /**
- * Retrato editável atual mantido pela sessão (sem I/O).
+ * Retrato editável atual mantido pela sessão (sem I/O), com cópia defensiva profunda de documento.
  */
-data class NoteEditorEditableSnapshot(
+class NoteEditorEditableSnapshot private constructor(
   val title: String,
   val document: NoteContentDocument,
   val effectiveFolderId: Long?,
@@ -294,6 +463,67 @@ data class NoteEditorEditableSnapshot(
 
   val intendedUserFolderId: Long?
     get() = fallbackSourceFolderId ?: effectiveFolderId
+
+  fun copy(
+    title: String = this.title,
+    document: NoteContentDocument = this.document,
+    effectiveFolderId: Long? = this.effectiveFolderId,
+    fallbackSourceFolderId: Long? = this.fallbackSourceFolderId,
+    paperStyle: NotePaperStyle = this.paperStyle,
+    isPinned: Boolean = this.isPinned,
+  ): NoteEditorEditableSnapshot =
+    invoke(
+      title = title,
+      document = document,
+      effectiveFolderId = effectiveFolderId,
+      fallbackSourceFolderId = fallbackSourceFolderId,
+      paperStyle = paperStyle,
+      isPinned = isPinned,
+    )
+
+  override fun equals(other: Any?): Boolean {
+    if (this === other) return true
+    if (other !is NoteEditorEditableSnapshot) return false
+    return title == other.title &&
+      document == other.document &&
+      effectiveFolderId == other.effectiveFolderId &&
+      fallbackSourceFolderId == other.fallbackSourceFolderId &&
+      paperStyle == other.paperStyle &&
+      isPinned == other.isPinned
+  }
+
+  override fun hashCode(): Int {
+    var result = title.hashCode()
+    result = 31 * result + document.hashCode()
+    result = 31 * result + (effectiveFolderId?.hashCode() ?: 0)
+    result = 31 * result + (fallbackSourceFolderId?.hashCode() ?: 0)
+    result = 31 * result + paperStyle.hashCode()
+    result = 31 * result + isPinned.hashCode()
+    return result
+  }
+
+  override fun toString(): String =
+    "NoteEditorEditableSnapshot(title=$title, document=$document, effectiveFolderId=$effectiveFolderId, " +
+      "fallbackSourceFolderId=$fallbackSourceFolderId, paperStyle=$paperStyle, isPinned=$isPinned)"
+
+  companion object {
+    operator fun invoke(
+      title: String,
+      document: NoteContentDocument,
+      effectiveFolderId: Long?,
+      fallbackSourceFolderId: Long?,
+      paperStyle: NotePaperStyle,
+      isPinned: Boolean,
+    ): NoteEditorEditableSnapshot =
+      NoteEditorEditableSnapshot(
+        title = title,
+        document = document.toImmutableSnapshot(),
+        effectiveFolderId = effectiveFolderId,
+        fallbackSourceFolderId = fallbackSourceFolderId,
+        paperStyle = paperStyle,
+        isPinned = isPinned,
+      )
+  }
 }
 
 data class DirtyChangeBreakdown(
@@ -330,7 +560,7 @@ data class NoteEditorSessionEvaluationInput(
   val blockReason: SessionBlockReason? = null,
 )
 
-data class NoteEditorSessionEvaluation(
+class NoteEditorSessionEvaluation private constructor(
   val hasUnsavedChanges: Boolean,
   val dirtyBreakdown: DirtyChangeBreakdown,
   val intendedUserFolderId: Long?,
@@ -341,7 +571,95 @@ data class NoteEditorSessionEvaluation(
   val canSafelyReconcileToCleanBaseline: Boolean,
   val consolidationReadiness: ConsolidationReadiness,
   val warnings: List<SessionWarning>,
-)
+) {
+  fun copy(
+    hasUnsavedChanges: Boolean = this.hasUnsavedChanges,
+    dirtyBreakdown: DirtyChangeBreakdown = this.dirtyBreakdown,
+    intendedUserFolderId: Long? = this.intendedUserFolderId,
+    effectiveFolderId: Long? = this.effectiveFolderId,
+    fallbackSourceFolderId: Long? = this.fallbackSourceFolderId,
+    hasPendingFolderFallback: Boolean = this.hasPendingFolderFallback,
+    needsDraftRetention: Boolean = this.needsDraftRetention,
+    canSafelyReconcileToCleanBaseline: Boolean = this.canSafelyReconcileToCleanBaseline,
+    consolidationReadiness: ConsolidationReadiness = this.consolidationReadiness,
+    warnings: List<SessionWarning> = this.warnings,
+  ): NoteEditorSessionEvaluation =
+    invoke(
+      hasUnsavedChanges = hasUnsavedChanges,
+      dirtyBreakdown = dirtyBreakdown,
+      intendedUserFolderId = intendedUserFolderId,
+      effectiveFolderId = effectiveFolderId,
+      fallbackSourceFolderId = fallbackSourceFolderId,
+      hasPendingFolderFallback = hasPendingFolderFallback,
+      needsDraftRetention = needsDraftRetention,
+      canSafelyReconcileToCleanBaseline = canSafelyReconcileToCleanBaseline,
+      consolidationReadiness = consolidationReadiness,
+      warnings = warnings,
+    )
+
+  override fun equals(other: Any?): Boolean {
+    if (this === other) return true
+    if (other !is NoteEditorSessionEvaluation) return false
+    return hasUnsavedChanges == other.hasUnsavedChanges &&
+      dirtyBreakdown == other.dirtyBreakdown &&
+      intendedUserFolderId == other.intendedUserFolderId &&
+      effectiveFolderId == other.effectiveFolderId &&
+      fallbackSourceFolderId == other.fallbackSourceFolderId &&
+      hasPendingFolderFallback == other.hasPendingFolderFallback &&
+      needsDraftRetention == other.needsDraftRetention &&
+      canSafelyReconcileToCleanBaseline == other.canSafelyReconcileToCleanBaseline &&
+      consolidationReadiness == other.consolidationReadiness &&
+      warnings == other.warnings
+  }
+
+  override fun hashCode(): Int {
+    var result = hasUnsavedChanges.hashCode()
+    result = 31 * result + dirtyBreakdown.hashCode()
+    result = 31 * result + (intendedUserFolderId?.hashCode() ?: 0)
+    result = 31 * result + (effectiveFolderId?.hashCode() ?: 0)
+    result = 31 * result + (fallbackSourceFolderId?.hashCode() ?: 0)
+    result = 31 * result + hasPendingFolderFallback.hashCode()
+    result = 31 * result + needsDraftRetention.hashCode()
+    result = 31 * result + canSafelyReconcileToCleanBaseline.hashCode()
+    result = 31 * result + consolidationReadiness.hashCode()
+    result = 31 * result + warnings.hashCode()
+    return result
+  }
+
+  override fun toString(): String =
+    "NoteEditorSessionEvaluation(hasUnsavedChanges=$hasUnsavedChanges, dirtyBreakdown=$dirtyBreakdown, " +
+      "intendedUserFolderId=$intendedUserFolderId, effectiveFolderId=$effectiveFolderId, " +
+      "fallbackSourceFolderId=$fallbackSourceFolderId, hasPendingFolderFallback=$hasPendingFolderFallback, " +
+      "needsDraftRetention=$needsDraftRetention, canSafelyReconcileToCleanBaseline=$canSafelyReconcileToCleanBaseline, " +
+      "consolidationReadiness=$consolidationReadiness, warnings=$warnings)"
+
+  companion object {
+    operator fun invoke(
+      hasUnsavedChanges: Boolean,
+      dirtyBreakdown: DirtyChangeBreakdown,
+      intendedUserFolderId: Long?,
+      effectiveFolderId: Long?,
+      fallbackSourceFolderId: Long?,
+      hasPendingFolderFallback: Boolean,
+      needsDraftRetention: Boolean,
+      canSafelyReconcileToCleanBaseline: Boolean,
+      consolidationReadiness: ConsolidationReadiness,
+      warnings: List<SessionWarning>,
+    ): NoteEditorSessionEvaluation =
+      NoteEditorSessionEvaluation(
+        hasUnsavedChanges = hasUnsavedChanges,
+        dirtyBreakdown = dirtyBreakdown,
+        intendedUserFolderId = intendedUserFolderId,
+        effectiveFolderId = effectiveFolderId,
+        fallbackSourceFolderId = fallbackSourceFolderId,
+        hasPendingFolderFallback = hasPendingFolderFallback,
+        needsDraftRetention = needsDraftRetention,
+        canSafelyReconcileToCleanBaseline = canSafelyReconcileToCleanBaseline,
+        consolidationReadiness = consolidationReadiness,
+        warnings = Collections.unmodifiableList(warnings.toList()),
+      )
+  }
+}
 
 /**
  * Resultado puro da preparação/abertura de uma solicitação antes da entrada no loop de edição.
@@ -356,8 +674,38 @@ sealed interface RecoveryOpeningEvaluation {
     val evaluation: NoteEditorSessionEvaluation,
   ) : RecoveryOpeningEvaluation
 
-  data class Blocked(
+  class Blocked private constructor(
     val reason: SessionBlockReason,
-    val warnings: List<SessionWarning> = emptyList(),
-  ) : RecoveryOpeningEvaluation
+    val warnings: List<SessionWarning>,
+  ) : RecoveryOpeningEvaluation {
+    fun copy(
+      reason: SessionBlockReason = this.reason,
+      warnings: List<SessionWarning> = this.warnings,
+    ): Blocked = invoke(reason = reason, warnings = warnings)
+
+    override fun equals(other: Any?): Boolean {
+      if (this === other) return true
+      if (other !is Blocked) return false
+      return reason == other.reason && warnings == other.warnings
+    }
+
+    override fun hashCode(): Int {
+      var result = reason.hashCode()
+      result = 31 * result + warnings.hashCode()
+      return result
+    }
+
+    override fun toString(): String = "Blocked(reason=$reason, warnings=$warnings)"
+
+    companion object {
+      operator fun invoke(
+        reason: SessionBlockReason,
+        warnings: List<SessionWarning> = emptyList(),
+      ): Blocked =
+        Blocked(
+          reason = reason,
+          warnings = Collections.unmodifiableList(warnings.toList()),
+        )
+    }
+  }
 }

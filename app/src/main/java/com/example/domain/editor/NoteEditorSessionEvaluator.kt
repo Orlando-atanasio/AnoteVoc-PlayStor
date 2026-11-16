@@ -9,6 +9,7 @@ import com.example.domain.model.NoteRecoveryDraft
 import com.example.domain.model.NoteRecoveryDraftKeys
 import com.example.domain.model.ParagraphBlock
 import com.example.domain.policy.NoteContentPolicy
+import java.util.Collections
 
 /**
  * Avaliador puro, determinístico e sem efeitos colaterais para abertura, comparação de baseline,
@@ -19,11 +20,17 @@ object NoteEditorSessionEvaluator {
   /**
    * Canonicaliza o documento preservando IDs, textos (sem trim), listas vazias e metadados de bloco:
    * 1) Aplica [NoteContentPolicy.normalizeDocument];
-   * 2) Aplica [NoteEditorTextHelpers.normalizeAndCoalesceSpans] em cada bloco.
+   * 2) Aplica [NoteEditorTextHelpers.normalizeAndCoalesceSpans] em cada bloco;
+   * 3) Garante propriedade imutável das listas de blocos e spans retornadas.
    */
   fun canonicalizeDocument(document: NoteContentDocument): NoteContentDocument {
     val policyNormalized = NoteContentPolicy.normalizeDocument(document)
-    if (policyNormalized.blocks.isEmpty()) return policyNormalized
+    if (policyNormalized.blocks.isEmpty()) {
+      return NoteContentDocument(
+        schemaVersion = policyNormalized.schemaVersion,
+        blocks = Collections.unmodifiableList(emptyList()),
+      )
+    }
 
     val coalescedBlocks: List<ContentBlock> =
       policyNormalized.blocks.map { block ->
@@ -35,10 +42,13 @@ object NoteEditorSessionEvaluator {
         NoteEditorTextHelpers.updateBlockTextAndSpans(
           block = block,
           text = block.text,
-          spans = coalescedSpans,
-        )
+          spans = Collections.unmodifiableList(coalescedSpans),
+        ).toImmutableSnapshot()
       }
-    return policyNormalized.copy(blocks = coalescedBlocks)
+    return NoteContentDocument(
+      schemaVersion = policyNormalized.schemaVersion,
+      blocks = Collections.unmodifiableList(coalescedBlocks),
+    )
   }
 
   /**
@@ -83,13 +93,16 @@ object NoteEditorSessionEvaluator {
   /**
    * Avalia a abertura de uma sessão (nova nota, nota existente ou recuperação de rascunho)
    * usando exclusivamente dados já carregados e mapas de disponibilidade já resolvidos.
+   *
+   * Para [NoteEditorOpenRequest.CreateNew] e [NoteEditorOpenRequest.OpenExisting], quando
+   * `request.sessionId` for nulo, o chamador DEVE informar um [generatedSessionId] exclusivo e válido.
    */
   fun evaluateOpening(
     request: NoteEditorOpenRequest,
     draft: NoteRecoveryDraft? = null,
     existingNote: Note? = null,
     folderAvailabilityById: Map<Long, FolderAvailability> = emptyMap(),
-    generatedSessionId: String = "session-default",
+    generatedSessionId: String? = null,
   ): RecoveryOpeningEvaluation =
     when (request) {
       is NoteEditorOpenRequest.CreateNew ->
@@ -116,13 +129,27 @@ object NoteEditorSessionEvaluator {
         )
     }
 
+  private fun resolveSessionId(
+    requestSessionId: String?,
+    generatedSessionId: String?,
+  ): String {
+    if (requestSessionId != null) {
+      return NoteRecoveryDraftKeys.normalizeAndValidateSessionId(requestSessionId)
+    }
+    val callerProvidedId =
+      generatedSessionId
+        ?: throw IllegalArgumentException(
+          "Um identificador de sessão exclusivo deve ser fornecido pelo chamador quando request.sessionId for nulo."
+        )
+    return NoteRecoveryDraftKeys.normalizeAndValidateSessionId(callerProvidedId)
+  }
+
   private fun evaluateCreateNew(
     request: NoteEditorOpenRequest.CreateNew,
     folderAvailabilityById: Map<Long, FolderAvailability>,
-    generatedSessionId: String,
+    generatedSessionId: String?,
   ): RecoveryOpeningEvaluation {
-    val cleanSessionId =
-      NoteRecoveryDraftKeys.normalizeAndValidateSessionId(request.sessionId ?: generatedSessionId)
+    val cleanSessionId = resolveSessionId(request.sessionId, generatedSessionId)
     val identity =
       NoteEditorSessionIdentity(
         draftId = NoteRecoveryDraftKeys.forNewNote(cleanSessionId),
@@ -188,8 +215,10 @@ object NoteEditorSessionEvaluator {
     request: NoteEditorOpenRequest.OpenExisting,
     existingNote: Note?,
     folderAvailabilityById: Map<Long, FolderAvailability>,
-    generatedSessionId: String,
+    generatedSessionId: String?,
   ): RecoveryOpeningEvaluation {
+    val cleanSessionId = resolveSessionId(request.sessionId, generatedSessionId)
+
     if (existingNote == null || existingNote.id != request.noteId) {
       return RecoveryOpeningEvaluation.Blocked(SessionBlockReason.TargetNoteNotFound(request.noteId))
     }
@@ -203,8 +232,6 @@ object NoteEditorSessionEvaluator {
       )
     }
 
-    val cleanSessionId =
-      NoteRecoveryDraftKeys.normalizeAndValidateSessionId(request.sessionId ?: generatedSessionId)
     val identity =
       NoteEditorSessionIdentity(
         draftId = NoteRecoveryDraftKeys.forExistingNote(existingNote.id, cleanSessionId),
@@ -279,6 +306,15 @@ object NoteEditorSessionEvaluator {
   ): RecoveryOpeningEvaluation {
     if (draft == null) {
       return RecoveryOpeningEvaluation.Blocked(SessionBlockReason.DraftNotFound(request.draftId))
+    }
+
+    if (draft.draftId != request.draftId) {
+      return RecoveryOpeningEvaluation.Blocked(
+        SessionBlockReason.DraftIdentityMismatch(
+          requestedDraftId = request.draftId,
+          providedDraftId = draft.draftId,
+        )
+      )
     }
 
     if (!matchesExpectation(draft.targetNoteId, request.expectedTarget)) {
@@ -451,7 +487,7 @@ object NoteEditorSessionEvaluator {
         )
       )
 
-    val combinedWarnings = (extraWarnings + baseEvaluation.warnings).distinct()
+    val combinedWarnings = Collections.unmodifiableList((extraWarnings + baseEvaluation.warnings).distinct())
     return RecoveryOpeningEvaluation.ReadyToEdit(
       identity = identity,
       baseline = baseline,
@@ -470,6 +506,14 @@ object NoteEditorSessionEvaluator {
     input: NoteEditorSessionEvaluationInput,
   ): NoteEditorSessionEvaluation {
     if (input.lifecycleStage != SessionLifecycleStage.EDITING) {
+      val coherentContext =
+        input.snapshot?.let { snap ->
+          resolveCoherentFolderContext(
+            baseline = input.baseline,
+            snapshot = snap,
+            folderContext = input.folderContext,
+          )
+        } ?: input.folderContext
       return NoteEditorSessionEvaluation(
         hasUnsavedChanges = false,
         dirtyBreakdown = DirtyChangeBreakdown(),
@@ -480,7 +524,7 @@ object NoteEditorSessionEvaluator {
         needsDraftRetention = false,
         canSafelyReconcileToCleanBaseline = false,
         consolidationReadiness = ConsolidationReadiness.BlockedBySessionState(input.blockReason),
-        warnings = collectWarnings(input, fallbackAppliedByEvaluator = null),
+        warnings = collectWarnings(input, coherentContext, fallbackAppliedByEvaluator = null),
       )
     }
 
@@ -496,7 +540,7 @@ object NoteEditorSessionEvaluator {
           needsDraftRetention = false,
           canSafelyReconcileToCleanBaseline = false,
           consolidationReadiness = ConsolidationReadiness.BlockedBySessionState(input.blockReason),
-          warnings = emptyList(),
+          warnings = Collections.unmodifiableList(emptyList()),
         )
 
     val snapshot =
@@ -511,16 +555,34 @@ object NoteEditorSessionEvaluator {
           needsDraftRetention = false,
           canSafelyReconcileToCleanBaseline = false,
           consolidationReadiness = ConsolidationReadiness.BlockedBySessionState(input.blockReason),
-          warnings = emptyList(),
+          warnings = Collections.unmodifiableList(emptyList()),
         )
+
+    // Valida coerência entre o snapshot e o folderContext antes de calcular dirty e consolidação.
+    val coherentContext =
+      resolveCoherentFolderContext(
+        baseline = baseline,
+        snapshot = snapshot,
+        folderContext = input.folderContext,
+      )
 
     // Se o destino efetivo corrente é sabidamente indisponível (InTrash / PermanentlyDeleted / NotFound),
     // aplica fallback efetivo para null preservando a pasta de origem em fallbackSourceFolderId.
     val (resolvedEffectiveFolderId, resolvedFallbackSourceFolderId, fallbackAppliedWarning) =
       normalizeUnavailableEffectiveTarget(
         snapshot = snapshot,
-        effectiveAvailability = input.folderContext.effectiveTarget,
+        effectiveAvailability = coherentContext.effectiveTarget,
       )
+
+    val effectiveContextAfterFallback =
+      if (fallbackAppliedWarning != null) {
+        coherentContext.copy(
+          effectiveTarget = FolderAvailability.Root,
+          fallbackSource = coherentContext.effectiveTarget,
+        )
+      } else {
+        coherentContext
+      }
 
     val intendedUserFolderId = resolvedFallbackSourceFolderId ?: resolvedEffectiveFolderId
     val hasPendingFolderFallback = resolvedFallbackSourceFolderId != null
@@ -554,18 +616,31 @@ object NoteEditorSessionEvaluator {
 
     val hasUnsavedChanges = dirtyBreakdown.hasAnyChange
     val isLegacy = baseline is NoteEditorBaseline.LegacyIndeterminate
-    val needsDraftRetention = hasUnsavedChanges || hasPendingFolderFallback || isLegacy
-    val canSafelyReconcileToCleanBaseline =
-      !hasUnsavedChanges && !hasPendingFolderFallback && !isLegacy
+    val hasActiveConflict = input.activeConflict != null
+    val hasUnknownCurrentDestination =
+      effectiveContextAfterFallback.effectiveTarget is FolderAvailability.Unknown
+    val needsDraftRetention =
+      hasUnsavedChanges ||
+        hasPendingFolderFallback ||
+        isLegacy ||
+        hasActiveConflict ||
+        hasUnknownCurrentDestination
+    val canSafelyReconcileToCleanBaseline = !needsDraftRetention
 
     val consolidationReadiness =
       evaluateConsolidationReadiness(
         input = input,
+        coherentContext = effectiveContextAfterFallback,
         resolvedEffectiveFolderId = resolvedEffectiveFolderId,
         resolvedFallbackSourceFolderId = resolvedFallbackSourceFolderId,
       )
 
-    val warnings = collectWarnings(input, fallbackAppliedByEvaluator = fallbackAppliedWarning)
+    val warnings =
+      collectWarnings(
+        input = input,
+        coherentContext = effectiveContextAfterFallback,
+        fallbackAppliedByEvaluator = fallbackAppliedWarning,
+      )
 
     return NoteEditorSessionEvaluation(
       hasUnsavedChanges = hasUnsavedChanges,
@@ -578,6 +653,85 @@ object NoteEditorSessionEvaluator {
       canSafelyReconcileToCleanBaseline = canSafelyReconcileToCleanBaseline,
       consolidationReadiness = consolidationReadiness,
       warnings = warnings,
+    )
+  }
+
+  /**
+   * Garante que `folderContext` corresponda exatamente aos identificadores presentes em `snapshot`
+   * e `baseline`, nunca convertendo informação ausente ou inconsistente em confirmação de raiz.
+   */
+  private fun resolveCoherentFolderContext(
+    baseline: NoteEditorBaseline?,
+    snapshot: NoteEditorEditableSnapshot,
+    folderContext: ResolvedDraftFolderContext,
+  ): ResolvedDraftFolderContext {
+    val coherentEffectiveTarget: FolderAvailability =
+      if (snapshot.effectiveFolderId == null) {
+        if (folderContext.effectiveTarget is FolderAvailability.Root) {
+          FolderAvailability.Root
+        } else {
+          val mismatchedId =
+            folderContext.effectiveTarget.folderIdOrNull
+              ?: error("FolderAvailability não-Root deve possuir folderId.")
+          FolderAvailability.Unknown(
+            folderId = mismatchedId,
+            reason = "Disponibilidade efetiva divergente para destino na raiz.",
+          )
+        }
+      } else {
+        val expectedId = snapshot.effectiveFolderId
+        val provided = folderContext.effectiveTarget
+        if (provided !is FolderAvailability.Root && provided.folderIdOrNull == expectedId) {
+          provided
+        } else {
+          FolderAvailability.Unknown(
+            folderId = expectedId,
+            reason = "Disponibilidade ausente ou divergente para a pasta $expectedId.",
+          )
+        }
+      }
+
+    val coherentFallbackSource: FolderAvailability? =
+      snapshot.fallbackSourceFolderId?.let { expectedFallbackId ->
+        val provided = folderContext.fallbackSource
+        if (provided != null && provided !is FolderAvailability.Root && provided.folderIdOrNull == expectedFallbackId) {
+          provided
+        } else {
+          FolderAvailability.Unknown(
+            folderId = expectedFallbackId,
+            reason = "Disponibilidade ausente ou divergente para a pasta de fallback $expectedFallbackId.",
+          )
+        }
+      }
+
+    val coherentInitialBaseline: FolderAvailability? =
+      when (baseline) {
+        is NoteEditorBaseline.NewNote ->
+          when (val baselineFolderId = baseline.staticFolderId) {
+            null ->
+              if (folderContext.initialBaseline is FolderAvailability.Root) FolderAvailability.Root else null
+            else -> {
+              val provided = folderContext.initialBaseline
+              when {
+                provided == null -> null
+                provided !is FolderAvailability.Root && provided.folderIdOrNull == baselineFolderId ->
+                  provided
+                else ->
+                  FolderAvailability.Unknown(
+                    folderId = baselineFolderId,
+                    reason = "Disponibilidade divergente para a pasta inicial $baselineFolderId.",
+                  )
+              }
+            }
+          }
+
+        else -> folderContext.initialBaseline
+      }
+
+    return folderContext.copy(
+      effectiveTarget = coherentEffectiveTarget,
+      fallbackSource = coherentFallbackSource,
+      initialBaseline = coherentInitialBaseline,
     )
   }
 
@@ -630,6 +784,7 @@ object NoteEditorSessionEvaluator {
 
   private fun evaluateConsolidationReadiness(
     input: NoteEditorSessionEvaluationInput,
+    coherentContext: ResolvedDraftFolderContext,
     resolvedEffectiveFolderId: Long?,
     resolvedFallbackSourceFolderId: Long?,
   ): ConsolidationReadiness {
@@ -638,8 +793,8 @@ object NoteEditorSessionEvaluator {
       return ConsolidationReadiness.BlockedByConflict(activeConflict)
     }
 
-    val effectiveAvailability = input.folderContext.effectiveTarget
-    if (resolvedFallbackSourceFolderId == null && effectiveAvailability is FolderAvailability.Unknown) {
+    val effectiveAvailability = coherentContext.effectiveTarget
+    if (effectiveAvailability is FolderAvailability.Unknown) {
       return ConsolidationReadiness.BlockedByUnknownFolderState(
         folderId = effectiveAvailability.folderId,
         reason = effectiveAvailability.reason,
@@ -648,7 +803,11 @@ object NoteEditorSessionEvaluator {
 
     if (resolvedFallbackSourceFolderId != null) {
       val fallbackAvailability =
-        input.folderContext.fallbackSource ?: FolderAvailability.NotFound(resolvedFallbackSourceFolderId)
+        coherentContext.fallbackSource
+          ?: FolderAvailability.Unknown(
+            folderId = resolvedFallbackSourceFolderId,
+            reason = "Disponibilidade ausente para a pasta de fallback $resolvedFallbackSourceFolderId.",
+          )
       return ConsolidationReadiness.RequiresExplicitFolderConfirmation(
         fallbackSourceFolderId = resolvedFallbackSourceFolderId,
         fallbackSourceAvailability = fallbackAvailability,
@@ -734,57 +893,57 @@ object NoteEditorSessionEvaluator {
 
   private fun collectWarnings(
     input: NoteEditorSessionEvaluationInput,
+    coherentContext: ResolvedDraftFolderContext,
     fallbackAppliedByEvaluator: SessionWarning.FallbackFolderApplied?,
   ): List<SessionWarning> =
-    buildList {
-      val snapshot = input.snapshot
-      if (fallbackAppliedByEvaluator != null) {
-        add(fallbackAppliedByEvaluator)
-      } else if (
-        snapshot?.fallbackSourceFolderId != null &&
-          input.folderContext.fallbackSource != null
-      ) {
-        add(
-          SessionWarning.FallbackFolderApplied(
-            originalFolderId = snapshot.fallbackSourceFolderId,
-            availability = input.folderContext.fallbackSource,
-          )
-        )
-      }
-
-      val effectiveTarget = input.folderContext.effectiveTarget
-      if (
-        snapshot?.fallbackSourceFolderId == null &&
-          effectiveTarget is FolderAvailability.Unknown
-      ) {
-        add(
-          SessionWarning.CurrentDestinationUnknown(
-            folderId = effectiveTarget.folderId,
-            reason = effectiveTarget.reason,
-          )
-        )
-      }
-
-      val initialBaseline = input.folderContext.initialBaseline
-      if (initialBaseline != null && initialBaseline.isDefinitelyUnavailable) {
-        initialBaseline.folderIdOrNull?.let { folderId ->
+    Collections.unmodifiableList(
+      buildList {
+        val snapshot = input.snapshot
+        if (fallbackAppliedByEvaluator != null) {
+          add(fallbackAppliedByEvaluator)
+        } else if (
+          snapshot?.fallbackSourceFolderId != null &&
+            coherentContext.fallbackSource != null
+        ) {
           add(
-            SessionWarning.OriginalBaselineFolderUnavailable(
-              baselineFolderId = folderId,
-              availability = initialBaseline,
+            SessionWarning.FallbackFolderApplied(
+              originalFolderId = snapshot.fallbackSourceFolderId,
+              availability = coherentContext.fallbackSource,
             )
           )
         }
-      }
 
-      val baseline = input.baseline
-      if (baseline is NoteEditorBaseline.LegacyIndeterminate) {
-        add(SessionWarning.LegacyDraftIndeterminateBaseline(baseline.draftId))
-      }
+        val effectiveTarget = coherentContext.effectiveTarget
+        if (effectiveTarget is FolderAvailability.Unknown) {
+          add(
+            SessionWarning.CurrentDestinationUnknown(
+              folderId = effectiveTarget.folderId,
+              reason = effectiveTarget.reason,
+            )
+          )
+        }
 
-      val conflict = input.activeConflict
-      if (conflict != null) {
-        add(SessionWarning.UnresolvedRecoveryConflict(conflict))
+        val initialBaseline = coherentContext.initialBaseline
+        if (initialBaseline != null && initialBaseline.isDefinitelyUnavailable) {
+          initialBaseline.folderIdOrNull?.let { folderId ->
+            add(
+              SessionWarning.OriginalBaselineFolderUnavailable(
+                baselineFolderId = folderId,
+                availability = initialBaseline,
+              )
+            )
+          }
+        }
+
+        val baseline = input.baseline
+        if (baseline is NoteEditorBaseline.LegacyIndeterminate) {
+          add(SessionWarning.LegacyDraftIndeterminateBaseline(baseline.draftId))
+        }
+
+        val conflict = input.activeConflict
+        if (conflict != null) {
+          add(SessionWarning.UnresolvedRecoveryConflict(conflict))
+        }
       }
-    }
+    )
 }

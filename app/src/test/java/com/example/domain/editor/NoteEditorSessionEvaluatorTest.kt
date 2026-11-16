@@ -894,6 +894,478 @@ class NoteEditorSessionEvaluatorTest {
     assertNotNull(ctxNotFound.fallbackSource)
   }
 
+  @Test
+  fun recoverDraft_requestedDraftIdDiffersFromProvidedDraft_returnsBlocked() {
+    val draftB =
+      sampleNewDraft(
+        sessionId = "rascunho-b",
+        title = "Conteúdo sigiloso de B",
+        initialPaperStyle = NotePaperStyle.LINHAS,
+      )
+
+    val result =
+      NoteEditorSessionEvaluator.evaluateOpening(
+        request =
+          NoteEditorOpenRequest.RecoverDraft(
+            draftId = NoteRecoveryDraftKeys.forNewNote("rascunho-a"),
+            expectedTarget = RecoveryTargetExpectation.Any,
+          ),
+        draft = draftB,
+      )
+
+    val blocked = result as RecoveryOpeningEvaluation.Blocked
+    assertEquals(
+      SessionBlockReason.DraftIdentityMismatch(
+        requestedDraftId = NoteRecoveryDraftKeys.forNewNote("rascunho-a"),
+        providedDraftId = draftB.draftId,
+      ),
+      blocked.reason,
+    )
+  }
+
+  @Test
+  fun openSession_withoutCallerSessionIdOrWithInvalidSessionId_throwsIllegalArgumentException() {
+    val note = sampleNote(id = 1L, folderId = null, title = "N", document = NoteContentDocument.empty())
+
+    assertThrows(IllegalArgumentException::class.java) {
+      NoteEditorSessionEvaluator.evaluateOpening(
+        request = NoteEditorOpenRequest.CreateNew(sessionId = null),
+      )
+    }
+
+    assertThrows(IllegalArgumentException::class.java) {
+      NoteEditorSessionEvaluator.evaluateOpening(
+        request = NoteEditorOpenRequest.OpenExisting(noteId = 1L, sessionId = null),
+        existingNote = note,
+      )
+    }
+
+    assertThrows(IllegalArgumentException::class.java) {
+      NoteEditorSessionEvaluator.evaluateOpening(
+        request = NoteEditorOpenRequest.CreateNew(sessionId = null),
+        generatedSessionId = "   ",
+      )
+    }
+
+    assertThrows(IllegalArgumentException::class.java) {
+      NoteEditorSessionEvaluator.evaluateOpening(
+        request = NoteEditorOpenRequest.CreateNew(sessionId = null),
+        generatedSessionId = "new",
+      )
+    }
+
+    assertThrows(IllegalArgumentException::class.java) {
+      NoteEditorSessionEvaluator.evaluateOpening(
+        request = NoteEditorOpenRequest.CreateNew(sessionId = "sessao invalida"),
+      )
+    }
+
+    val validOpening =
+      NoteEditorSessionEvaluator.evaluateOpening(
+        request = NoteEditorOpenRequest.OpenExisting(noteId = 1L, sessionId = null),
+        existingNote = note,
+        generatedSessionId = "caller-unique-42",
+      ) as RecoveryOpeningEvaluation.ReadyToEdit
+    assertEquals("caller-unique-42", validOpening.identity.sessionId)
+    assertEquals(NoteRecoveryDraftKeys.forExistingNote(1L, "caller-unique-42"), validOpening.identity.draftId)
+  }
+
+  @Test
+  fun snapshotFolderContextCoherence_validatesAllSixDeterministicScenarios() {
+    val folder10 = sampleFolder(id = 10L, name = "Dez")
+    val folder20 = sampleFolder(id = 20L, name = "Vinte", isDeleted = true)
+    val folder66 = sampleFolder(id = 66L, name = "SessentaESeis")
+    val folder99 = sampleFolder(id = 99L, name = "NoventaENove")
+    val emptyCanonical = NoteEditorSessionEvaluator.canonicalizeDocument(NoteContentDocument.empty())
+
+    val baseIn20 =
+      NoteEditorBaseline.NewNote(
+        title = "",
+        normalizedContent = emptyCanonical,
+        paperStyle = NotePaperStyle.LINHAS,
+        staticFolderId = folder20.id,
+        initialIsPinned = false,
+      )
+
+    fun evalWith(
+      effectiveFolderId: Long?,
+      fallbackSourceFolderId: Long?,
+      folderContext: ResolvedDraftFolderContext,
+      baseline: NoteEditorBaseline = baseIn20,
+    ): NoteEditorSessionEvaluation =
+      NoteEditorSessionEvaluator.evaluateSession(
+        NoteEditorSessionEvaluationInput(
+          lifecycleStage = SessionLifecycleStage.EDITING,
+          baseline = baseline,
+          snapshot =
+            NoteEditorEditableSnapshot(
+              title = "",
+              document = NoteContentDocument.empty(),
+              effectiveFolderId = effectiveFolderId,
+              fallbackSourceFolderId = fallbackSourceFolderId,
+              paperStyle = NotePaperStyle.LINHAS,
+              isPinned = false,
+            ),
+          folderContext = folderContext,
+        )
+      )
+
+    // 1. Snapshot com pasta 55 e contexto padrão Root -> Unknown(55), bloqueado, sem fallback para raiz
+    val case1 =
+      evalWith(
+        effectiveFolderId = 55L,
+        fallbackSourceFolderId = null,
+        folderContext = ResolvedDraftFolderContext(),
+      )
+    assertEquals(55L, case1.effectiveFolderId)
+    assertNull(case1.fallbackSourceFolderId)
+    assertFalse(case1.hasPendingFolderFallback)
+    val readiness1 = case1.consolidationReadiness as ConsolidationReadiness.BlockedByUnknownFolderState
+    assertEquals(55L, readiness1.folderId)
+    assertTrue(case1.warnings.any { it is SessionWarning.CurrentDestinationUnknown && it.folderId == 55L })
+
+    // 2. Snapshot com pasta 55 e contexto Active para pasta 66 -> Unknown(55), bloqueado
+    val case2 =
+      evalWith(
+        effectiveFolderId = 55L,
+        fallbackSourceFolderId = null,
+        folderContext = ResolvedDraftFolderContext(effectiveTarget = FolderAvailability.Active(folder66)),
+      )
+    assertEquals(55L, case2.effectiveFolderId)
+    val readiness2 = case2.consolidationReadiness as ConsolidationReadiness.BlockedByUnknownFolderState
+    assertEquals(55L, readiness2.folderId)
+    assertTrue(case2.warnings.any { it is SessionWarning.CurrentDestinationUnknown && it.folderId == 55L })
+
+    // 3. Snapshot com pasta 55 e contexto Unknown para pasta 55 -> Unknown(55), bloqueado
+    val case3 =
+      evalWith(
+        effectiveFolderId = 55L,
+        fallbackSourceFolderId = null,
+        folderContext = ResolvedDraftFolderContext(effectiveTarget = FolderAvailability.Unknown(55L, "Erro I/O")),
+      )
+    val readiness3 = case3.consolidationReadiness as ConsolidationReadiness.BlockedByUnknownFolderState
+    assertEquals(55L, readiness3.folderId)
+    assertTrue(case3.warnings.any { it is SessionWarning.CurrentDestinationUnknown && it.folderId == 55L })
+
+    // 4. Snapshot em Root com contexto Root -> Ready(null) (mas divergente se contexto não for Root)
+    val case4RootOk =
+      evalWith(
+        effectiveFolderId = null,
+        fallbackSourceFolderId = null,
+        folderContext = ResolvedDraftFolderContext(effectiveTarget = FolderAvailability.Root),
+      )
+    assertEquals(ConsolidationReadiness.Ready(null), case4RootOk.consolidationReadiness)
+    assertFalse(case4RootOk.warnings.any { it is SessionWarning.CurrentDestinationUnknown })
+
+    val case4RootDivergent =
+      evalWith(
+        effectiveFolderId = null,
+        fallbackSourceFolderId = null,
+        folderContext = ResolvedDraftFolderContext(effectiveTarget = FolderAvailability.Active(folder66)),
+      )
+    assertTrue(case4RootDivergent.consolidationReadiness is ConsolidationReadiness.BlockedByUnknownFolderState)
+
+    // 5. Fallback histórico 88 com identificador divergente no contexto (Active 99) ->
+    // exige confirmação explícita com Unknown(88), sem reativar nem bloquear como destino atual
+    val case5 =
+      evalWith(
+        effectiveFolderId = null,
+        fallbackSourceFolderId = 88L,
+        folderContext =
+          ResolvedDraftFolderContext(
+            effectiveTarget = FolderAvailability.Root,
+            fallbackSource = FolderAvailability.Active(folder99),
+          ),
+      )
+    assertNull(case5.effectiveFolderId)
+    assertEquals(88L, case5.fallbackSourceFolderId)
+    val readiness5 =
+      case5.consolidationReadiness as ConsolidationReadiness.RequiresExplicitFolderConfirmation
+    assertEquals(88L, readiness5.fallbackSourceFolderId)
+    assertTrue(readiness5.fallbackSourceAvailability is FolderAvailability.Unknown)
+    assertEquals(88L, (readiness5.fallbackSourceAvailability as FolderAvailability.Unknown).folderId)
+
+    // 6. Baseline histórico indisponível (InTrash ou Unknown) sem bloqueio indevido do destino atual (Active 10)
+    val case6Trash =
+      evalWith(
+        effectiveFolderId = folder10.id,
+        fallbackSourceFolderId = null,
+        folderContext =
+          ResolvedDraftFolderContext(
+            effectiveTarget = FolderAvailability.Active(folder10),
+            initialBaseline = FolderAvailability.InTrash(folder20),
+          ),
+      )
+    assertEquals(ConsolidationReadiness.Ready(folder10.id), case6Trash.consolidationReadiness)
+    assertTrue(
+      case6Trash.warnings.any {
+        it is SessionWarning.OriginalBaselineFolderUnavailable && it.baselineFolderId == folder20.id
+      }
+    )
+
+    val case6Unknown =
+      evalWith(
+        effectiveFolderId = folder10.id,
+        fallbackSourceFolderId = null,
+        folderContext =
+          ResolvedDraftFolderContext(
+            effectiveTarget = FolderAvailability.Active(folder10),
+            initialBaseline = FolderAvailability.Unknown(folder20.id),
+          ),
+      )
+    assertEquals(ConsolidationReadiness.Ready(folder10.id), case6Unknown.consolidationReadiness)
+  }
+
+  @Test
+  fun defensiveCopies_protectBaselineSnapshotCanonicalDocAndWarningsFromCallerMutation() {
+    val mutableSpans = mutableListOf(FormatSpan(0, 4, TextFormatStyle.BOLD))
+    val mutableBlocks =
+      mutableListOf<com.example.domain.model.ContentBlock>(
+        ParagraphBlock(id = "p1", text = "Texto", spans = mutableSpans)
+      )
+    val mutableDoc = NoteContentDocument(blocks = mutableBlocks)
+
+    val baseline =
+      NoteEditorBaseline.NewNote(
+        title = "T",
+        normalizedContent = mutableDoc,
+        paperStyle = NotePaperStyle.LINHAS,
+        staticFolderId = null,
+        initialIsPinned = false,
+      )
+    val snapshot =
+      NoteEditorEditableSnapshot(
+        title = "T",
+        document = mutableDoc,
+        effectiveFolderId = null,
+        fallbackSourceFolderId = null,
+        paperStyle = NotePaperStyle.LINHAS,
+        isPinned = false,
+      )
+    val canonicalDoc = NoteEditorSessionEvaluator.canonicalizeDocument(mutableDoc)
+
+    val mutableWarnings =
+      mutableListOf<SessionWarning>(SessionWarning.LegacyDraftIndeterminateBaseline("new_x"))
+    val evaluation =
+      NoteEditorSessionEvaluation(
+        hasUnsavedChanges = true,
+        dirtyBreakdown = DirtyChangeBreakdown(titleChanged = true),
+        intendedUserFolderId = null,
+        effectiveFolderId = null,
+        fallbackSourceFolderId = null,
+        hasPendingFolderFallback = false,
+        needsDraftRetention = true,
+        canSafelyReconcileToCleanBaseline = false,
+        consolidationReadiness = ConsolidationReadiness.Ready(null),
+        warnings = mutableWarnings,
+      )
+    val blocked =
+      RecoveryOpeningEvaluation.Blocked(
+        reason = SessionBlockReason.DraftNotFound("new_x"),
+        warnings = mutableWarnings,
+      )
+
+    // Mutações posteriores nas coleções originais do chamador
+    mutableSpans.add(FormatSpan(0, 2, TextFormatStyle.ITALIC))
+    mutableBlocks.add(ParagraphBlock(id = "p2", text = "Injetado"))
+    mutableWarnings.add(SessionWarning.CurrentDestinationUnknown(99L))
+
+    // Objetos construídos permanecem isolados e imutáveis
+    assertEquals(1, baseline.normalizedContent.blocks.size)
+    assertEquals(1, baseline.normalizedContent.blocks[0].spans.size)
+    assertEquals(1, snapshot.document.blocks.size)
+    assertEquals(1, snapshot.document.blocks[0].spans.size)
+    assertEquals(1, canonicalDoc.blocks.size)
+    assertEquals(1, canonicalDoc.blocks[0].spans.size)
+    assertEquals(1, evaluation.warnings.size)
+    assertEquals(1, blocked.warnings.size)
+
+    assertThrows(UnsupportedOperationException::class.java) {
+      @Suppress("UNCHECKED_CAST")
+      (snapshot.document.blocks as MutableList<com.example.domain.model.ContentBlock>).clear()
+    }
+    assertThrows(UnsupportedOperationException::class.java) {
+      @Suppress("UNCHECKED_CAST")
+      (snapshot.document.blocks[0].spans as MutableList<FormatSpan>).clear()
+    }
+    assertThrows(UnsupportedOperationException::class.java) {
+      @Suppress("UNCHECKED_CAST")
+      (evaluation.warnings as MutableList<SessionWarning>).clear()
+    }
+    assertThrows(UnsupportedOperationException::class.java) {
+      @Suppress("UNCHECKED_CAST")
+      (blocked.warnings as MutableList<SessionWarning>).clear()
+    }
+  }
+
+  @Test
+  fun draftRetentionAndCleanReconciliation_respectActiveConflictInvalidBaseAndUnknownCurrentDestination() {
+    val folder10 = sampleFolder(id = 10L, name = "Dez")
+    val doc =
+      NoteEditorSessionEvaluator.canonicalizeDocument(
+        NoteContentDocument(blocks = listOf(ParagraphBlock(id = "p1", text = "Corpo")))
+      )
+    val existingBaseline =
+      NoteEditorBaseline.ExistingNote(
+        noteId = 70L,
+        baseRevision = 3L,
+        baseNoteUpdatedAt = 3000L,
+        title = "Nota",
+        normalizedContent = doc,
+        paperStyle = NotePaperStyle.LINHAS,
+        staticFolderId = folder10.id,
+        currentDbIsPinned = false,
+      )
+    val matchingCleanSnapshot =
+      NoteEditorEditableSnapshot(
+        title = "Nota",
+        document = doc,
+        effectiveFolderId = folder10.id,
+        fallbackSourceFolderId = null,
+        paperStyle = NotePaperStyle.LINHAS,
+        isPinned = false,
+      )
+    val activeContext =
+      ResolvedDraftFolderContext(
+        effectiveTarget = FolderAvailability.Active(folder10),
+        existingNoteFolder = FolderAvailability.Active(folder10),
+      )
+
+    // 1. Conflito ativo (NoteDiverged) com snapshot idêntico ao baseline:
+    // retenção = true, reconciliação = false, BlockedByConflict
+    val divergedConflict =
+      RecoveryConflict.NoteDiverged(
+        draftId = NoteRecoveryDraftKeys.forExistingNote(70L, "s-conf"),
+        targetNoteId = 70L,
+        draftBaseRevision = 2L,
+        currentNoteRevision = 3L,
+        draftBaseUpdatedAt = 2000L,
+        currentNoteUpdatedAt = 3000L,
+      )
+    val evalDiverged =
+      NoteEditorSessionEvaluator.evaluateSession(
+        NoteEditorSessionEvaluationInput(
+          lifecycleStage = SessionLifecycleStage.EDITING,
+          baseline = existingBaseline,
+          snapshot = matchingCleanSnapshot,
+          folderContext = activeContext,
+          activeConflict = divergedConflict,
+        )
+      )
+    assertFalse(evalDiverged.hasUnsavedChanges)
+    assertTrue(evalDiverged.needsDraftRetention)
+    assertFalse(evalDiverged.canSafelyReconcileToCleanBaseline)
+    assertEquals(
+      ConsolidationReadiness.BlockedByConflict(divergedConflict),
+      evalDiverged.consolidationReadiness,
+    )
+
+    // 2. Conflito InvalidBaseReference com snapshot limpo:
+    // retenção = true, reconciliação = false, BlockedByConflict
+    val invalidBaseConflict =
+      RecoveryConflict.InvalidBaseReference(
+        draftId = NoteRecoveryDraftKeys.forExistingNote(70L, "s-inv"),
+        targetNoteId = 70L,
+        draftBaseRevision = 0L,
+        draftBaseUpdatedAt = null,
+      )
+    val evalInvalidBase =
+      NoteEditorSessionEvaluator.evaluateSession(
+        NoteEditorSessionEvaluationInput(
+          lifecycleStage = SessionLifecycleStage.EDITING,
+          baseline = existingBaseline,
+          snapshot = matchingCleanSnapshot,
+          folderContext = activeContext,
+          activeConflict = invalidBaseConflict,
+        )
+      )
+    assertFalse(evalInvalidBase.hasUnsavedChanges)
+    assertTrue(evalInvalidBase.needsDraftRetention)
+    assertFalse(evalInvalidBase.canSafelyReconcileToCleanBaseline)
+    assertEquals(
+      ConsolidationReadiness.BlockedByConflict(invalidBaseConflict),
+      evalInvalidBase.consolidationReadiness,
+    )
+
+    // 3. Destino atual Unknown com identificador igual ao baseline e snapshot limpo:
+    // retenção = true, reconciliação = false, BlockedByUnknownFolderState
+    val evalUnknownCurrent =
+      NoteEditorSessionEvaluator.evaluateSession(
+        NoteEditorSessionEvaluationInput(
+          lifecycleStage = SessionLifecycleStage.EDITING,
+          baseline = existingBaseline,
+          snapshot = matchingCleanSnapshot,
+          folderContext =
+            ResolvedDraftFolderContext(
+              effectiveTarget = FolderAvailability.Unknown(folder10.id, "Erro de leitura"),
+              existingNoteFolder = FolderAvailability.Unknown(folder10.id, "Erro de leitura"),
+            ),
+          activeConflict = null,
+        )
+      )
+    assertFalse(evalUnknownCurrent.hasUnsavedChanges)
+    assertTrue(evalUnknownCurrent.needsDraftRetention)
+    assertFalse(evalUnknownCurrent.canSafelyReconcileToCleanBaseline)
+    assertEquals(
+      ConsolidationReadiness.BlockedByUnknownFolderState(folder10.id, "Erro de leitura"),
+      evalUnknownCurrent.consolidationReadiness,
+    )
+
+    // 4. Destino atual Active e referência histórica Unknown, sem conflito e com estado limpo:
+    // não bloqueia consolidação nem reconciliação automática
+    val evalHistoricalUnknownOnly =
+      NoteEditorSessionEvaluator.evaluateSession(
+        NoteEditorSessionEvaluationInput(
+          lifecycleStage = SessionLifecycleStage.EDITING,
+          baseline = existingBaseline,
+          snapshot = matchingCleanSnapshot,
+          folderContext =
+            ResolvedDraftFolderContext(
+              effectiveTarget = FolderAvailability.Active(folder10),
+              initialBaseline = FolderAvailability.Unknown(999L, "Histórico desconhecido"),
+              existingNoteFolder = FolderAvailability.Unknown(999L, "Histórico desconhecido"),
+            ),
+          activeConflict = null,
+        )
+      )
+    assertFalse(evalHistoricalUnknownOnly.hasUnsavedChanges)
+    assertFalse(evalHistoricalUnknownOnly.needsDraftRetention)
+    assertTrue(evalHistoricalUnknownOnly.canSafelyReconcileToCleanBaseline)
+    assertEquals(
+      ConsolidationReadiness.Ready(folder10.id),
+      evalHistoricalUnknownOnly.consolidationReadiness,
+    )
+
+    // 5. Conflito e destino atual Unknown simultaneamente:
+    // conflito tem prioridade na prontidão para consolidação e a retenção permanece ativa
+    val evalConflictAndUnknown =
+      NoteEditorSessionEvaluator.evaluateSession(
+        NoteEditorSessionEvaluationInput(
+          lifecycleStage = SessionLifecycleStage.EDITING,
+          baseline = existingBaseline,
+          snapshot = matchingCleanSnapshot,
+          folderContext =
+            ResolvedDraftFolderContext(
+              effectiveTarget = FolderAvailability.Unknown(folder10.id, "Timeout"),
+            ),
+          activeConflict = divergedConflict,
+        )
+      )
+    assertFalse(evalConflictAndUnknown.hasUnsavedChanges)
+    assertTrue(evalConflictAndUnknown.needsDraftRetention)
+    assertFalse(evalConflictAndUnknown.canSafelyReconcileToCleanBaseline)
+    assertEquals(
+      ConsolidationReadiness.BlockedByConflict(divergedConflict),
+      evalConflictAndUnknown.consolidationReadiness,
+    )
+    assertTrue(
+      evalConflictAndUnknown.warnings.any { it is SessionWarning.UnresolvedRecoveryConflict }
+    )
+    assertTrue(
+      evalConflictAndUnknown.warnings.any { it is SessionWarning.CurrentDestinationUnknown }
+    )
+  }
+
   private fun sampleFolder(
     id: Long,
     name: String,
