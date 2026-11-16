@@ -729,20 +729,37 @@ class SingleFlightRoomPersistenceExecutor(
           createdPending
         }
 
+      val newInput =
+        executionPending.newPayload.toDraftInput(
+          checkpointRevision = executionPending.newDraftRevision
+        )
       try {
-        val newInput =
-          executionPending.newPayload.toDraftInput(
-            checkpointRevision = executionPending.newDraftRevision
-          )
-        when (
-          val result =
+        val result =
+          try {
             draftRepository.replaceCheckpointWithNewNote(
               oldDraftId = executionPending.oldDraftId,
               expectedOldSessionId = executionPending.expectedOldSessionId,
               expectedOldTargetNoteId = executionPending.expectedOldTargetNoteId,
               newInput = newInput,
             )
-        ) {
+          } catch (e: InvalidRecoveryDraftException) {
+            val snap =
+              synchronized(stateLock) {
+                if (existingPending == null) {
+                  // Rejeição transacional determinística na primeira tentativa: o repositório
+                  // executa dentro de transação única com rollback integral garantido, não havendo
+                  // substituição pendente. Mantemos presence=UNKNOWN para exigir reconciliação
+                  // antes de confirmar sincronização.
+                  pendingReplacement = null
+                }
+                checkpointPresence = CheckpointPresence.UNKNOWN
+                hasInFlightOperation = false
+                snapshotLocked()
+              }
+            return@withLock ReplaceCheckpointExecutionResult.Failed(cause = e, snapshot = snap)
+          }
+
+        when (result) {
           is ReplaceCheckpointWithNewNoteResult.Replaced -> {
             val draft = result.draft
             if (

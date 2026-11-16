@@ -986,6 +986,255 @@ class SingleFlightRoomPersistenceExecutorTest {
     }
 
   @Test
+  fun replaceCheckpointWithNewNote_deterministicRepositoryRejection_clearsPendingStatePreservesOldIdentityAndAllowsReconcile() =
+    runBlocking {
+      val draftRepo = FakeDraftRepository()
+      val noteRepo = FakeNoteRepository()
+      val oldIdentity = existingNoteIdentity(noteId = 51L, sessionId = "old-51")
+      val collidingIdentity = newNoteIdentity("colliding-51")
+      val newIdentity = newNoteIdentity("colliding-51")
+
+      draftRepo.seedDraft(
+        draftId = oldIdentity.draftId,
+        sessionId = oldIdentity.sessionId,
+        targetNoteId = 51L,
+        title = "rascunho-antigo-51",
+        checkpointRevision = 3L,
+      )
+      // Outro rascunho já ocupa sessionId = "colliding-51" com draftId diferente simulando colisão transacional Case C.
+      // Para forçar colisão pura de sessionId em draftId distinto, semeamos um rascunho de nota existente com mesmo sessionId.
+      val blockerNoteIdentity = existingNoteIdentity(noteId = 99L, sessionId = collidingIdentity.sessionId)
+      draftRepo.seedDraft(
+        draftId = blockerNoteIdentity.draftId,
+        sessionId = blockerNoteIdentity.sessionId,
+        targetNoteId = 99L,
+        title = "bloqueador-51",
+        checkpointRevision = 1L,
+      )
+
+      val executor =
+        SingleFlightRoomPersistenceExecutor(
+          draftRepository = draftRepo,
+          noteRepository = noteRepo,
+          initialIdentity = oldIdentity,
+          initialPresence = CheckpointPresence.PRESENT,
+          initialConfirmedRevision = 3L,
+        )
+
+      val newPayload = payloadFor(newIdentity, title = "conversao-rejeitada", baseRevision = 0L, baseNoteUpdatedAt = null)
+      val rejected =
+        executor.replaceCheckpointWithNewNote(
+          oldDraftId = oldIdentity.draftId,
+          expectedOldSessionId = oldIdentity.sessionId,
+          expectedOldTargetNoteId = 51L,
+          newPayload = newPayload,
+          newDraftRevision = 1L,
+        )
+
+      assertTrue(rejected is ReplaceCheckpointExecutionResult.Failed)
+      val failed = rejected as ReplaceCheckpointExecutionResult.Failed
+      assertTrue(failed.cause is InvalidRecoveryDraftException)
+      assertNull(failed.snapshot.pendingReplacement)
+      assertFalse(failed.snapshot.hasPendingReplacement)
+      assertFalse(failed.snapshot.hasInFlightOperation)
+      assertEquals(oldIdentity.draftId, failed.snapshot.draftId)
+      assertEquals(oldIdentity.sessionId, failed.snapshot.sessionId)
+      assertEquals(51L, failed.snapshot.targetNoteId)
+      assertEquals(CheckpointPresence.UNKNOWN, failed.snapshot.checkpointPresence)
+      assertFalse(failed.snapshot.isSyncConfirmationAllowed)
+
+      // Banco permanece integralmente revertido.
+      assertEquals("rascunho-antigo-51", draftRepo.getCheckpointById(oldIdentity.draftId)?.title)
+      assertNull(draftRepo.getCheckpointById(newIdentity.draftId))
+      assertEquals("bloqueador-51", draftRepo.getCheckpointById(blockerNoteIdentity.draftId)?.title)
+
+      // Estado posterior pode ser recuperado via reconciliação sem ficar preso em pendência.
+      val reconciled = executor.reconcileCheckpointPresence(oldIdentity.draftId)
+      assertTrue(reconciled is ReconcileCheckpointExecutionResult.Reconciled)
+      val reconciledSnap = reconciled.snapshot
+      assertEquals(CheckpointPresence.PRESENT, reconciledSnap.checkpointPresence)
+      assertEquals(3L, reconciledSnap.confirmedCheckpointRevision)
+      assertFalse(reconciledSnap.hasPendingReplacement)
+      assertTrue(reconciledSnap.isSyncConfirmationAllowed)
+
+      // Nova gravação na identidade antiga volta a operar normalmente.
+      val postSave = executor.saveCheckpoint(payloadFor(oldIdentity, title = "pos-rejeicao-reconciliada"))
+      assertTrue(postSave is SaveCheckpointExecutionResult.Saved)
+      assertEquals(4L, (postSave as SaveCheckpointExecutionResult.Saved).allocatedRevision)
+    }
+
+  @Test
+  fun replaceCheckpointWithNewNote_postCommitIdentityMismatch_preservesPendingStateAndBlocksIncompatibleOpsUntilValidRetry() =
+    runBlocking {
+      val draftRepo = FakeDraftRepository()
+      val noteRepo = FakeNoteRepository()
+      val oldIdentity = existingNoteIdentity(noteId = 52L, sessionId = "old-52")
+      val newIdentity = newNoteIdentity("new-52")
+      draftRepo.seedDraft(oldIdentity.draftId, oldIdentity.sessionId, 52L, "original-52", 2L)
+
+      val executor =
+        SingleFlightRoomPersistenceExecutor(
+          draftRepository = draftRepo,
+          noteRepository = noteRepo,
+          initialIdentity = oldIdentity,
+          initialPresence = CheckpointPresence.PRESENT,
+          initialConfirmedRevision = 2L,
+        )
+
+      val newPayload = payloadFor(newIdentity, title = "copia-52", baseRevision = 0L, baseNoteUpdatedAt = null)
+
+      // Simula cenário em que o repositório efetivou a transação, mas retornou um draft com identidade divergente.
+      draftRepo.replaceResultTransform = { result ->
+        val committedDraft = (result as ReplaceCheckpointWithNewNoteResult.Replaced).draft
+        ReplaceCheckpointWithNewNoteResult.Replaced(
+          committedDraft.copy(
+            draftId = "new_divergente",
+            sessionId = "divergente",
+          )
+        )
+      }
+
+      val mismatchFailure =
+        executor.replaceCheckpointWithNewNote(
+          oldDraftId = oldIdentity.draftId,
+          expectedOldSessionId = oldIdentity.sessionId,
+          expectedOldTargetNoteId = 52L,
+          newPayload = newPayload,
+          newDraftRevision = 1L,
+        )
+
+      assertTrue(mismatchFailure is ReplaceCheckpointExecutionResult.Failed)
+      val failed = mismatchFailure as ReplaceCheckpointExecutionResult.Failed
+      assertTrue(failed.cause is InvalidRecoveryDraftException)
+      assertTrue(failed.snapshot.hasPendingReplacement)
+      assertTrue(failed.snapshot.pendingReplacement != null)
+      assertFalse(failed.snapshot.hasInFlightOperation)
+      assertEquals(oldIdentity.draftId, failed.snapshot.draftId)
+      assertEquals(CheckpointPresence.UNKNOWN, failed.snapshot.checkpointPresence)
+      assertFalse(failed.snapshot.isSyncConfirmationAllowed)
+
+      // Confirma que a transação do repositório já havia excluído o antigo e persistido o novo.
+      assertNull(draftRepo.getCheckpointById(oldIdentity.draftId))
+      assertEquals("copia-52", draftRepo.getCheckpointById(newIdentity.draftId)?.title)
+
+      // Operações incompatíveis continuam bloqueadas sem gerar I/O.
+      val callsBeforeBlocked = draftRepo.callLog.size
+      assertTrue(
+        executor.saveCheckpoint(payloadFor(oldIdentity, title = "bloqueado")) is SaveCheckpointExecutionResult.Failed
+      )
+      assertTrue(executor.deleteCheckpoint(oldIdentity.draftId) is DeleteCheckpointExecutionResult.Failed)
+      assertTrue(
+        executor.consolidateCreateNote(
+          title = "N",
+          content = sampleDocument("c"),
+          folderId = null,
+          isPinned = false,
+          paperStyle = NotePaperStyle.LINHAS,
+        ) is ConsolidateNoteExecutionResult.Failed
+      )
+      assertTrue(
+        executor.consolidateUpdateNote(
+          noteId = 52L,
+          title = "U",
+          content = sampleDocument("c"),
+          folderId = null,
+          paperStyle = NotePaperStyle.LINHAS,
+          expectedBaseRevision = 2L,
+        ) is ConsolidateNoteExecutionResult.Failed
+      )
+      assertTrue(executor.reconcileCheckpointPresence(oldIdentity.draftId) is ReconcileCheckpointExecutionResult.Failed)
+      assertEquals(callsBeforeBlocked, draftRepo.callLog.size)
+      assertNull(draftRepo.getCheckpointById(oldIdentity.draftId))
+
+      // Repetição idêntica após correção da anomalia resolve via AlreadyReplaced e restaura sincronização permitida.
+      draftRepo.replaceResultTransform = null
+      val resolved =
+        executor.replaceCheckpointWithNewNote(
+          oldDraftId = oldIdentity.draftId,
+          expectedOldSessionId = oldIdentity.sessionId,
+          expectedOldTargetNoteId = 52L,
+          newPayload = newPayload,
+          newDraftRevision = 1L,
+        )
+      assertTrue(resolved is ReplaceCheckpointExecutionResult.AlreadyReplaced)
+      assertEquals(newIdentity.draftId, resolved.snapshot.draftId)
+      assertEquals(CheckpointPresence.PRESENT, resolved.snapshot.checkpointPresence)
+      assertFalse(resolved.snapshot.hasPendingReplacement)
+      assertNull(resolved.snapshot.pendingReplacement)
+      assertTrue(resolved.snapshot.isSyncConfirmationAllowed)
+    }
+
+  @Test
+  fun replaceCheckpointWithNewNote_repositoryInvalidDraftDuringRetryAfterIndeterminateFailure_keepsPendingStateIntact() =
+    runBlocking {
+      val draftRepo = FakeDraftRepository()
+      val noteRepo = FakeNoteRepository()
+      val oldIdentity = existingNoteIdentity(noteId = 53L, sessionId = "old-53")
+      val newIdentity = newNoteIdentity("new-53")
+      draftRepo.seedDraft(oldIdentity.draftId, oldIdentity.sessionId, 53L, "original-53", 2L)
+
+      val executor =
+        SingleFlightRoomPersistenceExecutor(
+          draftRepository = draftRepo,
+          noteRepository = noteRepo,
+          initialIdentity = oldIdentity,
+          initialPresence = CheckpointPresence.PRESENT,
+          initialConfirmedRevision = 2L,
+        )
+
+      val newPayload = payloadFor(newIdentity, title = "copia-53", baseRevision = 0L, baseNoteUpdatedAt = null)
+
+      // 1. Falha indeterminada após commit estabelece pendingReplacement.
+      draftRepo.failAfterReplaceCommit = true
+      val firstFailure =
+        executor.replaceCheckpointWithNewNote(
+          oldDraftId = oldIdentity.draftId,
+          expectedOldSessionId = oldIdentity.sessionId,
+          expectedOldTargetNoteId = 53L,
+          newPayload = newPayload,
+        )
+      assertTrue(firstFailure is ReplaceCheckpointExecutionResult.Failed)
+      assertTrue(firstFailure.snapshot.hasPendingReplacement)
+
+      // 2. Retry encontra InvalidRecoveryDraftException no repositório enquanto pendingReplacement já estava ativo:
+      // como uma tentativa anterior pode já ter efetivado commit, a pendência NÃO pode ser limpa.
+      draftRepo.failAfterReplaceCommit = false
+      draftRepo.onReplaceHook = { throw InvalidRecoveryDraftException("conflito inesperado na repetição") }
+      val retryFailure =
+        executor.replaceCheckpointWithNewNote(
+          oldDraftId = oldIdentity.draftId,
+          expectedOldSessionId = oldIdentity.sessionId,
+          expectedOldTargetNoteId = 53L,
+          newPayload = newPayload,
+        )
+      assertTrue(retryFailure is ReplaceCheckpointExecutionResult.Failed)
+      assertTrue((retryFailure as ReplaceCheckpointExecutionResult.Failed).cause is InvalidRecoveryDraftException)
+      assertTrue(retryFailure.snapshot.hasPendingReplacement)
+      assertFalse(retryFailure.snapshot.isSyncConfirmationAllowed)
+      assertEquals(oldIdentity.draftId, retryFailure.snapshot.draftId)
+
+      val callsBeforeBlocked = draftRepo.callLog.size
+      assertTrue(
+        executor.saveCheckpoint(payloadFor(oldIdentity, title = "nao-recria")) is SaveCheckpointExecutionResult.Failed
+      )
+      assertEquals(callsBeforeBlocked, draftRepo.callLog.size)
+
+      // 3. Repetição idêntica limpa conclui via AlreadyReplaced.
+      draftRepo.onReplaceHook = null
+      val resolved =
+        executor.replaceCheckpointWithNewNote(
+          oldDraftId = oldIdentity.draftId,
+          expectedOldSessionId = oldIdentity.sessionId,
+          expectedOldTargetNoteId = 53L,
+          newPayload = newPayload,
+        )
+      assertTrue(resolved is ReplaceCheckpointExecutionResult.AlreadyReplaced)
+      assertFalse(resolved.snapshot.hasPendingReplacement)
+      assertEquals(newIdentity.draftId, resolved.snapshot.draftId)
+      assertTrue(resolved.snapshot.isSyncConfirmationAllowed)
+    }
+
+  @Test
   fun consolidateCreateNote_passesClearDraftIdOnlyWhenCheckpointPresentOrFoundViaUnknownReconciliation() =
     runBlocking {
       val draftRepo = FakeDraftRepository()
@@ -1493,6 +1742,7 @@ class SingleFlightRoomPersistenceExecutorTest {
   fun saveCheckpoint_staleRevisionReturnsIgnoredStaleRevisionBeforeInitialMetadataValidation() =
     runBlocking {
       val draftRepo = FakeDraftRepository()
+      val noteRepo = FakeNoteRepository()
       val identity = newNoteIdentity("stale-order")
       draftRepo.seedDraft(
         draftId = identity.draftId,
@@ -1500,13 +1750,23 @@ class SingleFlightRoomPersistenceExecutorTest {
         targetNoteId = null,
         title = "persisted-rev-5",
         checkpointRevision = 5L,
+        initialFolderId = 10L,
+        initialPaperStyle = NotePaperStyle.FOREST_MIST,
       )
 
+      val executor =
+        SingleFlightRoomPersistenceExecutor(
+          draftRepository = draftRepo,
+          noteRepository = noteRepo,
+          initialIdentity = identity,
+          initialPresence = CheckpointPresence.PRESENT,
+          initialConfirmedRevision = 1L,
+          initialHighestAllocatedRevision = 1L,
+        )
+
       val staleWithDifferentInitialMetadata =
-        NoteRecoveryDraftInput(
-          draftId = identity.draftId,
-          targetNoteId = null,
-          sessionId = identity.sessionId,
+        CheckpointSavePayload.fromIdentity(
+          identity = identity,
           folderId = 77L,
           initialFolderId = 77L,
           fallbackSourceFolderId = null,
@@ -1516,15 +1776,21 @@ class SingleFlightRoomPersistenceExecutorTest {
           paperStyle = NotePaperStyle.TECH_DARK,
           initialPaperStyle = NotePaperStyle.TECH_DARK,
           baseRevision = 0L,
-          checkpointRevision = 4L,
           baseNoteUpdatedAt = null,
         )
 
-      val result = draftRepo.saveCheckpoint(staleWithDifferentInitialMetadata)
-      assertTrue(result is SaveCheckpointResult.IgnoredStaleRevision)
-      val ignored = result as SaveCheckpointResult.IgnoredStaleRevision
+      val result = executor.saveCheckpoint(staleWithDifferentInitialMetadata)
+      assertTrue(result is SaveCheckpointExecutionResult.IgnoredStaleRevision)
+      val ignored = result as SaveCheckpointExecutionResult.IgnoredStaleRevision
       assertEquals(5L, ignored.persistedCheckpointRevision)
-      assertEquals(4L, ignored.attemptedCheckpointRevision)
+      assertEquals(2L, ignored.attemptedCheckpointRevision)
+      assertEquals(5L, ignored.snapshot.confirmedCheckpointRevision)
+      assertEquals(5L, ignored.snapshot.highestAllocatedRevision)
+      assertEquals(CheckpointPresence.PRESENT, ignored.snapshot.checkpointPresence)
+
+      val persisted = draftRepo.getCheckpointById(identity.draftId)!!
+      assertEquals(10L, persisted.initialFolderId)
+      assertEquals(NotePaperStyle.FOREST_MIST, persisted.initialPaperStyle)
     }
 
   @Test
@@ -1750,6 +2016,9 @@ class SingleFlightRoomPersistenceExecutorTest {
     var onDeleteHook: (suspend (String) -> Unit)? = null
     var onReplaceHook: (suspend () -> Unit)? = null
     var failAfterReplaceCommit: Boolean = false
+    var replaceResultTransform:
+      ((ReplaceCheckpointWithNewNoteResult) -> ReplaceCheckpointWithNewNoteResult)? =
+      null
 
     private inline fun <T> trackConcurrency(block: () -> T): T {
       val current = concurrentCalls.incrementAndGet()
@@ -1771,20 +2040,22 @@ class SingleFlightRoomPersistenceExecutorTest {
       title: String,
       checkpointRevision: Long,
       checkpointAt: Long = 1_000L + checkpointRevision,
+      initialFolderId: Long? = null,
+      initialPaperStyle: NotePaperStyle? = NotePaperStyle.LINHAS,
     ) {
       store[draftId] =
         NoteRecoveryDraft(
           draftId = draftId,
           targetNoteId = targetNoteId,
           sessionId = sessionId,
-          folderId = null,
-          initialFolderId = null,
+          folderId = initialFolderId,
+          initialFolderId = initialFolderId,
           fallbackSourceFolderId = null,
           isPinned = false,
           title = title,
           contentState = NoteContentState.Valid(NoteContentDocument(blocks = listOf(ParagraphBlock("b1", title)))),
-          paperStyle = NotePaperStyle.LINHAS,
-          initialPaperStyle = NotePaperStyle.LINHAS,
+          paperStyle = initialPaperStyle ?: NotePaperStyle.LINHAS,
+          initialPaperStyle = initialPaperStyle,
           baseRevision = if (targetNoteId == null) 0L else 1L,
           checkpointRevision = checkpointRevision,
           baseNoteUpdatedAt = if (targetNoteId == null) null else 1_000L,
@@ -2055,7 +2326,8 @@ class SingleFlightRoomPersistenceExecutorTest {
               "Inconsistência detectada: rascunho anterior '$cleanOldDraftId' e novo checkpoint '$cleanNewDraftId' coexistem."
             )
           }
-          return@trackConcurrency ReplaceCheckpointWithNewNoteResult.AlreadyReplaced(existingNew)
+          val baseResult = ReplaceCheckpointWithNewNoteResult.AlreadyReplaced(existingNew)
+          return@trackConcurrency replaceResultTransform?.invoke(baseResult) ?: baseResult
         }
 
         val created =
@@ -2081,7 +2353,8 @@ class SingleFlightRoomPersistenceExecutorTest {
         if (failAfterReplaceCommit) {
           throw IOException("simulated crash right after commit")
         }
-        ReplaceCheckpointWithNewNoteResult.Replaced(created)
+        val baseResult = ReplaceCheckpointWithNewNoteResult.Replaced(created)
+        replaceResultTransform?.invoke(baseResult) ?: baseResult
       }
 
     override suspend fun deleteCheckpoint(draftId: String) {
