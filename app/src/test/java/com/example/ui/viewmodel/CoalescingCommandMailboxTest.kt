@@ -1110,6 +1110,29 @@ class CoalescingCommandMailboxTest {
       )
     }
 
+  @Test
+  fun enqueueCompletion_structuralRetryRequested_deliveredAheadOfRetainedFifoUnderActiveBarrier() =
+    runBlocking {
+      val mailbox = CoalescingCommandMailbox()
+      val token = mailbox.enterBarrier(BarrierReason.CONFLICT_RESOLUTION)
+      val retained = SessionCommand.InsertText("Edicao-retida")
+      assertEquals(SubmitCommandResult.Accepted(1L), mailbox.submit(retained))
+
+      val retry =
+        PersistenceCompletion.StructuralRetryRequested(operationId = 55L, barrierToken = token)
+      mailbox.enqueueCompletion(retry)
+
+      // Enquanto barreira está ativa, apenas StructuralRetryRequested sai; FIFO segue retida.
+      val first = withTimeout(2_000L) { mailbox.receiveNext() }
+      assertEquals(MailboxItem.Completion(retry), first)
+      assertEquals(1, mailbox.fifoQueueSize)
+      assertTrue(mailbox.barrierActive)
+
+      assertTrue(mailbox.releaseBarrier(token))
+      val second = withTimeout(2_000L) { mailbox.receiveNext() }
+      assertEquals(MailboxItem.Command(QueuedSessionCommand(retained, 1L)), second)
+    }
+
   private fun CoalescingCommandMailbox.submitAndConsumeAsSynced(generation: Long, seqCount: Int) {
     val startApplied = appliedMutationSequence
     repeat(seqCount) { idx ->

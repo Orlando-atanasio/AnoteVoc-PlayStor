@@ -157,11 +157,13 @@ object NoteEditorSessionEvaluator {
         targetNoteId = null,
       )
 
+    val resolvedPaperStyle = request.defaultPaperStyle ?: NotePaperStyle.LINHAS
+
     val baseline =
       NoteEditorBaseline.NewNote(
         title = "",
         normalizedContent = canonicalizeDocument(NoteContentDocument.empty()),
-        paperStyle = request.defaultPaperStyle,
+        paperStyle = resolvedPaperStyle,
         staticFolderId = request.initialFolderId,
         initialIsPinned = request.initialPinned,
       )
@@ -187,7 +189,7 @@ object NoteEditorSessionEvaluator {
         document = NoteContentDocument.empty(),
         effectiveFolderId = effectiveFolderId,
         fallbackSourceFolderId = fallbackSourceFolderId,
-        paperStyle = request.defaultPaperStyle,
+        paperStyle = resolvedPaperStyle,
         isPinned = request.initialPinned,
       )
 
@@ -743,12 +745,34 @@ object NoteEditorSessionEvaluator {
   fun applyFolderAvailabilityToSnapshot(
     snapshot: NoteEditorEditableSnapshot,
     folderAvailabilityById: Map<Long, FolderAvailability>,
+    previousContext: ResolvedDraftFolderContext? = null,
+    baseline: NoteEditorBaseline? = null,
   ): Pair<NoteEditorEditableSnapshot, ResolvedDraftFolderContext> {
+    val mergedAvailability = mergeAvailabilityMap(folderAvailabilityById, previousContext)
     val (effectiveFolderId, fallbackSourceFolderId, effectiveAvailability, fallbackAvailability) =
       resolveDestinationTuple(
         requestedEffectiveFolderId = snapshot.effectiveFolderId,
         requestedFallbackSourceFolderId = snapshot.fallbackSourceFolderId,
-        folderAvailabilityById = folderAvailabilityById,
+        folderAvailabilityById = mergedAvailability,
+      )
+
+    val preservedInitialBaseline =
+      resolvePreservedAnchorAvailability(
+        anchorFolderId = (baseline as? NoteEditorBaseline.NewNote)?.staticFolderId,
+        anchorIsRootBaseline = baseline is NoteEditorBaseline.NewNote && baseline.staticFolderId == null,
+        previousAvailability = previousContext?.initialBaseline,
+        incomingAvailabilityById = folderAvailabilityById,
+        mergedAvailabilityById = mergedAvailability,
+      )
+
+    val preservedExistingNoteFolder =
+      resolvePreservedAnchorAvailability(
+        anchorFolderId = (baseline as? NoteEditorBaseline.ExistingNote)?.staticFolderId,
+        anchorIsRootBaseline =
+          baseline is NoteEditorBaseline.ExistingNote && baseline.staticFolderId == null,
+        previousAvailability = previousContext?.existingNoteFolder,
+        incomingAvailabilityById = folderAvailabilityById,
+        mergedAvailabilityById = mergedAvailability,
       )
 
     val updatedSnapshot =
@@ -760,8 +784,59 @@ object NoteEditorSessionEvaluator {
       ResolvedDraftFolderContext(
         effectiveTarget = effectiveAvailability,
         fallbackSource = fallbackAvailability,
+        initialBaseline = preservedInitialBaseline,
+        existingNoteFolder = preservedExistingNoteFolder,
       )
     return updatedSnapshot to context
+  }
+
+  private fun mergeAvailabilityMap(
+    incoming: Map<Long, FolderAvailability>,
+    previousContext: ResolvedDraftFolderContext?,
+  ): Map<Long, FolderAvailability> {
+    if (previousContext == null) return incoming
+    val merged = HashMap<Long, FolderAvailability>(incoming.size + 4)
+    listOfNotNull(
+      previousContext.effectiveTarget,
+      previousContext.fallbackSource,
+      previousContext.initialBaseline,
+      previousContext.existingNoteFolder,
+    ).forEach { prev ->
+      val prevId = prev.folderIdOrNull
+      if (prevId != null && prev !is FolderAvailability.Root) {
+        merged[prevId] = prev
+      }
+    }
+    merged.putAll(incoming)
+    return merged
+  }
+
+  private fun resolvePreservedAnchorAvailability(
+    anchorFolderId: Long?,
+    anchorIsRootBaseline: Boolean,
+    previousAvailability: FolderAvailability?,
+    incomingAvailabilityById: Map<Long, FolderAvailability>,
+    mergedAvailabilityById: Map<Long, FolderAvailability>,
+  ): FolderAvailability? {
+    if (anchorIsRootBaseline) {
+      return previousAvailability as? FolderAvailability.Root ?: FolderAvailability.Root
+    }
+    if (anchorFolderId != null) {
+      incomingAvailabilityById[anchorFolderId]?.let { return it }
+      if (
+        previousAvailability != null &&
+          previousAvailability !is FolderAvailability.Root &&
+          previousAvailability.folderIdOrNull == anchorFolderId
+      ) {
+        return previousAvailability
+      }
+      return mergedAvailabilityById[anchorFolderId] ?: previousAvailability
+    }
+    val prevId = previousAvailability?.folderIdOrNull
+    if (prevId != null) {
+      return incomingAvailabilityById[prevId] ?: previousAvailability
+    }
+    return previousAvailability
   }
 
   fun matchesExpectation(

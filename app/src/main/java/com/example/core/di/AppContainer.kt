@@ -11,10 +11,17 @@ import com.example.data.repository.FolderRepositoryImpl
 import com.example.data.repository.NoteRecoveryDraftRepositoryImpl
 import com.example.data.repository.NoteRepositoryImpl
 import com.example.data.repository.PreferencesRepositoryImpl
+import com.example.domain.editor.NoteEditorOpenRequest
 import com.example.domain.repository.FolderRepository
 import com.example.domain.repository.NoteRecoveryDraftRepository
 import com.example.domain.repository.NoteRepository
 import com.example.domain.repository.PreferencesRepository
+import com.example.ui.viewmodel.ActiveSessionRegistry
+import com.example.ui.viewmodel.NoteEditorSessionCoordinator
+import com.example.ui.viewmodel.PendingReplacementReconciler
+import com.example.ui.viewmodel.ReplacementHandoffTracker
+import com.example.ui.viewmodel.SessionOpenLoader
+import kotlinx.coroutines.CoroutineScope
 
 /**
  * Contêiner leve de dependências por injeção manual de construtor,
@@ -72,4 +79,50 @@ class AppContainer(context: Context) {
       clock = clock,
     )
   }
+
+  val activeSessionRegistry: ActiveSessionRegistry by lazy { ActiveSessionRegistry() }
+
+  val replacementHandoffTracker: ReplacementHandoffTracker by lazy {
+    ReplacementHandoffTracker(clock = clock)
+  }
+
+  val sessionOpenLoader: SessionOpenLoader by lazy {
+    SessionOpenLoader(
+      noteRepository = noteRepository,
+      folderRepository = folderRepository,
+      draftRepository = noteRecoveryDraftRepository,
+      preferencesRepository = preferencesRepository,
+      activeSessionRegistry = activeSessionRegistry,
+      handoffTracker = replacementHandoffTracker,
+    )
+  }
+
+  val pendingReplacementReconciler: PendingReplacementReconciler by lazy {
+    PendingReplacementReconciler(
+      noteRepository = noteRepository,
+      draftRepository = noteRecoveryDraftRepository,
+      activeSessionRegistry = activeSessionRegistry,
+      handoffTracker = replacementHandoffTracker,
+    )
+  }
+
+  fun createNoteEditorSessionCoordinator(
+    openRequest: NoteEditorOpenRequest,
+    parentScope: CoroutineScope,
+    autosaveDebounceMillis: Long = NoteEditorSessionCoordinator.DEFAULT_AUTOSAVE_DEBOUNCE_MILLIS,
+  ): NoteEditorSessionCoordinator =
+    NoteEditorSessionCoordinator(
+      openRequest = openRequest,
+      sessionOpenLoader = sessionOpenLoader,
+      replacementReconciler = pendingReplacementReconciler,
+      handoffTracker = replacementHandoffTracker,
+      activeSessionRegistry = activeSessionRegistry,
+      draftRepository = noteRecoveryDraftRepository,
+      noteRepository = noteRepository,
+      folderRepository = folderRepository,
+      dispatchers = dispatchers,
+      clock = clock,
+      parentScope = parentScope,
+      autosaveDebounceMillis = autosaveDebounceMillis,
+    )
 }

@@ -121,4 +121,13 @@ class SessionCommandModelsTest {
       (completion.availabilityById as MutableMap<Long, FolderAvailability>).clear()
     }
   }
+
+  @Test
+  fun structuralRetryRequested_preservesOperationIdAndExactBarrierToken() {
+    val token = BarrierToken(id = 77L, reason = BarrierReason.CONSOLIDATION)
+    val retry = PersistenceCompletion.StructuralRetryRequested(operationId = 15L, barrierToken = token)
+    assertEquals(15L, retry.operationId)
+    assertEquals(token, retry.barrierToken)
+    assertEquals(BarrierReason.CONSOLIDATION, retry.barrierToken.reason)
+  }
 }

@@ -62,7 +62,7 @@ sealed interface RecoveryTargetExpectation {
 sealed interface NoteEditorOpenRequest {
   data class CreateNew(
     val initialFolderId: Long? = null,
-    val defaultPaperStyle: NotePaperStyle = NotePaperStyle.LINHAS,
+    val defaultPaperStyle: NotePaperStyle? = null,
     val initialPinned: Boolean = false,
     val sessionId: String? = null,
   ) : NoteEditorOpenRequest
@@ -394,6 +394,12 @@ sealed interface SessionBlockReason {
   data class InvalidPersistedDraftKeys(
     val draftId: String,
     val reason: String,
+  ) : SessionBlockReason
+
+  data class SessionAlreadyActive(
+    val requestedDraftId: String?,
+    val requestedSessionId: String?,
+    val requestedTargetNoteId: Long?,
   ) : SessionBlockReason
 }
 

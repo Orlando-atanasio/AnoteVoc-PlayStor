@@ -309,6 +309,11 @@ sealed interface PersistenceCompletion {
     val terminal: Boolean,
     val failure: Throwable? = null,
   ) : PersistenceCompletion
+
+  data class StructuralRetryRequested(
+    override val operationId: Long,
+    val barrierToken: BarrierToken,
+  ) : PersistenceCompletion
 }
 
 /**

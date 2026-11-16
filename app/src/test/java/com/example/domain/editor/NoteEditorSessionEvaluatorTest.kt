@@ -1366,6 +1366,74 @@ class NoteEditorSessionEvaluatorTest {
     )
   }
 
+  @Test
+  fun createNew_withNullDefaultPaperStyle_resolvesLinhasFallback() {
+    val result =
+      NoteEditorSessionEvaluator.evaluateOpening(
+        request =
+          NoteEditorOpenRequest.CreateNew(
+            initialFolderId = null,
+            defaultPaperStyle = null,
+            initialPinned = false,
+            sessionId = "sess-null-paper",
+          )
+      ) as RecoveryOpeningEvaluation.ReadyToEdit
+
+    val baseline = result.baseline as NoteEditorBaseline.NewNote
+    assertEquals(NotePaperStyle.LINHAS, baseline.paperStyle)
+    assertEquals(NotePaperStyle.LINHAS, result.initialSnapshot.paperStyle)
+    assertFalse(result.evaluation.hasUnsavedChanges)
+  }
+
+  @Test
+  fun applyFolderAvailabilityToSnapshot_withPartialMapPreservesInitialBaselineAndExistingNoteFolder() {
+    val folder10 = sampleFolder(id = 10L, name = "Origem")
+    val folder20 = sampleFolder(id = 20L, name = "Destino")
+    val existingNote =
+      sampleNote(
+        id = 7L,
+        folderId = folder10.id,
+        title = "Nota 7",
+        document = NoteContentDocument(blocks = listOf(ParagraphBlock(id = "b1", text = "Corpo"))),
+      )
+    val opening =
+      NoteEditorSessionEvaluator.evaluateOpening(
+        request = NoteEditorOpenRequest.OpenExisting(noteId = existingNote.id, sessionId = "sess-partial"),
+        existingNote = existingNote,
+        folderAvailabilityById = mapOf(folder10.id to FolderAvailability.InTrash(folder10)),
+      ) as RecoveryOpeningEvaluation.ReadyToEdit
+
+    // Usuário muda destino para folder20 (ainda sem folder10 no mapa parcial observado).
+    val movedSnapshot =
+      opening.initialSnapshot.copy(
+        effectiveFolderId = folder20.id,
+        fallbackSourceFolderId = null,
+      )
+    val (updatedSnap, updatedContext) =
+      NoteEditorSessionEvaluator.applyFolderAvailabilityToSnapshot(
+        snapshot = movedSnapshot,
+        folderAvailabilityById = mapOf(folder20.id to FolderAvailability.Active(folder20)),
+        previousContext = opening.folderContext,
+        baseline = opening.baseline,
+      )
+
+    assertEquals(folder20.id, updatedSnap.effectiveFolderId)
+    assertEquals(FolderAvailability.Active(folder20), updatedContext.effectiveTarget)
+    assertEquals(FolderAvailability.InTrash(folder10), updatedContext.existingNoteFolder)
+    assertEquals(FolderAvailability.InTrash(folder10), updatedContext.initialBaseline)
+
+    val eval =
+      NoteEditorSessionEvaluator.evaluateSession(
+        NoteEditorSessionEvaluationInput(
+          lifecycleStage = SessionLifecycleStage.EDITING,
+          baseline = opening.baseline,
+          snapshot = updatedSnap,
+          folderContext = updatedContext,
+        )
+      )
+    assertTrue(eval.warnings.any { it is SessionWarning.OriginalBaselineFolderUnavailable })
+  }
+
   private fun sampleFolder(
     id: Long,
     name: String,
