@@ -10,10 +10,18 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.suspendCancellableCoroutine
 
 /**
- * Caixa de correio coordenada com ponto único de linearização (`lock`) entre:
+ * Caixa de correio coordenada (modelo MPSC — múltiplos produtores e consumidor único) com ponto
+ * único de linearização (`lock`) entre:
  * - aceitação síncrona de comandos e sequência monotônica `acceptedMutationSequence`;
  * - fila FIFO de comandos e fila `pendingCompletions` com barreira estrutural e anti-starvation;
  * - publicação linearizada de [NoteEditorUiState] impedindo falsos estados `Saved`/`Idle`.
+ *
+ * Contrato de consumidor único:
+ * - Esta classe pressupõe **no máximo um consumidor ativo por vez** chamando [receiveNext] ou
+ *   [pollNext], devendo o loop consumidor ser estritamente serializado pelo futuro coordenador.
+ * - Não existe trava/restrição em tempo de execução impedindo múltiplas chamadas simultâneas a
+ *   [receiveNext]; caso múltiplos consumidores ativos coexistissem, um cancelamento com
+ *   requeue (`requeueUndeliveredItem`) poderia violar a ordem FIFO entre comandos.
  *
  * Nenhuma operação de I/O ou callback de continuação é executada sob [lock].
  */
@@ -46,7 +54,10 @@ class CoalescingCommandMailbox(
 
   private val fifoQueue = ArrayDeque<QueuedSessionCommand>()
   private val pendingCompletions = ArrayDeque<PersistenceCompletion>()
-  private val waiters = ArrayDeque<CancellableContinuation<Unit>>()
+  private val waiters = ArrayDeque<CancellableContinuation<PollAttempt>>()
+
+  @Volatile internal var beforeSuspendRegistrationHook: (() -> Unit)? = null
+  @Volatile internal var afterImmediateResumeHook: (() -> Unit)? = null
 
   private var acceptedSequence: Long = initialAcceptedMutationSequence
   private var appliedSequence: Long = initialAppliedMutationSequence
@@ -63,6 +74,9 @@ class CoalescingCommandMailbox(
 
   val barrierActive: Boolean
     get() = synchronized(lock) { activeBarrierToken != null }
+
+  val activeBarrierReason: BarrierReason?
+    get() = synchronized(lock) { activeBarrierToken?.reason }
 
   val isClosed: Boolean
     get() = synchronized(lock) { closed }
@@ -88,7 +102,7 @@ class CoalescingCommandMailbox(
    */
   fun submit(command: SessionCommand): SubmitCommandResult {
     var result: SubmitCommandResult
-    var toWake: List<CancellableContinuation<Unit>> = emptyList()
+    var toWake: List<CancellableContinuation<PollAttempt>> = emptyList()
 
     synchronized(lock) {
       if (closed) {
@@ -132,7 +146,7 @@ class CoalescingCommandMailbox(
    * Enfileira uma conclusão assíncrona em `pendingCompletions` e acorda consumidores aguardando.
    */
   fun enqueueCompletion(completion: PersistenceCompletion) {
-    val toWake: List<CancellableContinuation<Unit>>
+    val toWake: List<CancellableContinuation<PollAttempt>>
     synchronized(lock) {
       pendingCompletions.addLast(completion)
       toWake = detachWaitersLocked()
@@ -172,11 +186,15 @@ class CoalescingCommandMailbox(
 
   /**
    * Libera a barreira ativa somente se [token] corresponder exatamente ao token ativo atual.
+   *
+   * Responsabilidade contratual do coordenador: só deve ser chamado pelo detentor legítimo após a
+   * operação estrutural protegida pela barreira (consolidação, resolução de conflito ou descarte)
+   * ter terminado definitivamente; nunca deve ser usado para interromper operação ainda em curso.
    * Quando liberada e houver itens retidos em `fifoQueue` ou fechamento pendente, acorda consumidores.
    */
   fun releaseBarrier(token: BarrierToken): Boolean {
     var released = false
-    var toWake: List<CancellableContinuation<Unit>> = emptyList()
+    var toWake: List<CancellableContinuation<PollAttempt>> = emptyList()
     synchronized(lock) {
       if (activeBarrierToken == token) {
         activeBarrierToken = null
@@ -197,7 +215,18 @@ class CoalescingCommandMailbox(
 
   /**
    * Suspende de forma cancelável até existir um item entregável segundo as regras de barreira e
-   * prioridade, ou até que o mailbox esteja fechado e sem itens entregáveis.
+   * prioridade, ou até que o mailbox esteja fechado, sem barreira ativa e sem itens entregáveis.
+   *
+   * Contrato de consumidor único:
+   * - Não pode haver mais de uma chamada consumidora ativa a [receiveNext] simultaneamente; o
+   *   consumo deve ser serializado pelo futuro coordenador da sessão.
+   * - Não há bloqueio em tempo de execução contra múltiplos consumidores simultâneos; sob
+   *   consumidor único, a recolocação na cabeça da fila via `requeueUndeliveredItem` em caso de
+   *   cancelamento preserva integralmente a ordem FIFO.
+   *
+   * Preserva integralmente o resultado da segunda tentativa atômica dentro de
+   * [suspendCancellableCoroutine] (`Deliver`, `TerminalEmpty` ou `MustWait`), garantindo que nenhum
+   * item retirado seja descartado nem mesmo em caso de cancelamento concorrente imediato.
    */
   suspend fun receiveNext(): MailboxItem? {
     while (true) {
@@ -209,23 +238,43 @@ class CoalescingCommandMailbox(
         PollAttempt.MustWait -> Unit
       }
 
-      suspendCancellableCoroutine<Unit> { cont ->
-        var immediateWake = false
-        synchronized(lock) {
-          if (attemptPollOrCheckTerminalLocked() != PollAttempt.MustWait) {
-            immediateWake = true
-          } else {
-            waiters.addLast(cont)
-          }
-        }
-        cont.invokeOnCancellation {
+      beforeSuspendRegistrationHook?.invoke()
+
+      val suspendedAttempt: PollAttempt =
+        suspendCancellableCoroutine { cont ->
+          var immediateAttempt: PollAttempt? = null
           synchronized(lock) {
-            waiters.remove(cont)
+            val secondAttempt = attemptPollOrCheckTerminalLocked()
+            if (secondAttempt == PollAttempt.MustWait) {
+              waiters.addLast(cont)
+            } else {
+              immediateAttempt = secondAttempt
+            }
+          }
+          cont.invokeOnCancellation {
+            synchronized(lock) {
+              waiters.remove(cont)
+            }
+          }
+          val resolved = immediateAttempt
+          if (resolved != null) {
+            if (cont.isActive) {
+              cont.resume(resolved) { _, value, _ ->
+                if (value is PollAttempt.Deliver) {
+                  requeueUndeliveredItem(value.item)
+                }
+              }
+              afterImmediateResumeHook?.invoke()
+            } else if (resolved is PollAttempt.Deliver) {
+              requeueUndeliveredItem(resolved.item)
+            }
           }
         }
-        if (immediateWake && cont.isActive) {
-          cont.resume(Unit)
-        }
+
+      when (suspendedAttempt) {
+        is PollAttempt.Deliver -> return suspendedAttempt.item
+        PollAttempt.TerminalEmpty -> return null
+        PollAttempt.MustWait -> Unit
       }
     }
   }
@@ -272,17 +321,73 @@ class CoalescingCommandMailbox(
     }
 
   /**
-   * Fecha definitivamente a aceitação de novos comandos sem descartar itens já aceitos.
-   * Consumidores recebem os itens pendentes já aceitos antes de encerrar.
+   * Fecha definitivamente a aceitação de novos comandos sem descartar itens já aceitos e sem
+   * interromper inseguramente uma operação estrutural em curso.
+   *
+   * Contrato coordenado de encerramento com barreira ativa:
+   * - Novos comandos submetidos após [close] são rejeitados com [SubmitRejectionReason.MAILBOX_CLOSED].
+   * - Conclusões assíncronas (`pendingCompletions`) continuam sendo aceitas e priorizadas para que
+   *   a operação estrutural ativa possa concluir sem perda de estado.
+   * - Se houver barreira estrutural ativa, `fifoQueue` permanece protegida até que o detentor
+   *   legítimo libere a barreira via [releaseBarrier] ou [closeAndReleaseBarrier], evitando
+   *   desbloqueio indevido; após a liberação, todos os comandos já aceitos em `fifoQueue` são
+   *   entregues em ordem antes de [receiveNext] retornar `null`.
    */
   fun close() {
-    val toWake: List<CancellableContinuation<Unit>>
+    val toWake: List<CancellableContinuation<PollAttempt>>
     synchronized(lock) {
       if (closed) return
       closed = true
-      toWake = detachWaitersLocked()
+      toWake =
+        if (activeBarrierToken == null || pendingCompletions.isNotEmpty()) {
+          detachWaitersLocked()
+        } else {
+          emptyList()
+        }
     }
     resumeWaiters(toWake)
+  }
+
+  /**
+   * Fecha definitivamente a aceitação de novos comandos e libera atomicamente a barreira estrutural
+   * ativa somente se [token] corresponder exatamente ao token ativo atual.
+   *
+   * Contrato explícito de responsabilidade do coordenador:
+   * - Este método **só pode ser chamado pelo detentor legítimo depois que a operação estrutural
+   *   protegida pela barreira (consolidação, descarte ou resolução de conflito) tiver terminado
+   *   definitivamente** (sucesso, falha definitiva ou limpeza final garantida após encerramento da
+   *   escrita/transação).
+   * - A liberação da barreira **nunca** deve ser usada para interromper, cancelar ou contornar uma
+   *   operação estrutural ainda em andamento.
+   *
+   * Comportamento para token válido ou inválido:
+   * - O fechamento da aceitação de novos comandos (`closed = true`) ocorre incondicionalmente na
+   *   chamada, mesmo quando [token] é inválido ou divergente (passando a rejeitar novas submissões
+   *   com [SubmitRejectionReason.MAILBOX_CLOSED]).
+   * - Retorna `true` apenas quando a barreira ativa foi efetivamente liberada por este [token].
+   * - Um [token] inválido, divergente ou ausente não desbloqueia a barreira ativa (retorna `false`),
+   *   mantendo a proteção da operação estrutural intacta mesmo após o fechamento da aceitação.
+   */
+  fun closeAndReleaseBarrier(token: BarrierToken): Boolean {
+    var released = false
+    val toWake: List<CancellableContinuation<PollAttempt>>
+    synchronized(lock) {
+      val wasClosed = closed
+      closed = true
+      if (activeBarrierToken == token) {
+        activeBarrierToken = null
+        released = true
+      }
+      val canAdvance = activeBarrierToken == null || pendingCompletions.isNotEmpty()
+      toWake =
+        if (released || (!wasClosed && canAdvance)) {
+          detachWaitersLocked()
+        } else {
+          emptyList()
+        }
+    }
+    resumeWaiters(toWake)
+    return released
   }
 
   /**
@@ -422,10 +527,39 @@ class CoalescingCommandMailbox(
     if (item != null) {
       return PollAttempt.Deliver(item)
     }
-    if (closed && fifoQueue.isEmpty() && pendingCompletions.isEmpty()) {
+    if (
+      closed &&
+        activeBarrierToken == null &&
+        fifoQueue.isEmpty() &&
+        pendingCompletions.isEmpty()
+    ) {
       return PollAttempt.TerminalEmpty
     }
     return PollAttempt.MustWait
+  }
+
+  private fun requeueUndeliveredItem(item: MailboxItem) {
+    val toWake: List<CancellableContinuation<PollAttempt>>
+    synchronized(lock) {
+      when (item) {
+        is MailboxItem.Command -> {
+          fifoQueue.addFirst(item.queued)
+          if (consecutiveFifoCounter > 0) {
+            consecutiveFifoCounter -= 1
+          }
+        }
+        is MailboxItem.Completion -> {
+          pendingCompletions.addFirst(item.completion)
+        }
+      }
+      toWake =
+        if (activeBarrierToken == null || item is MailboxItem.Completion) {
+          detachWaitersLocked()
+        } else {
+          emptyList()
+        }
+    }
+    resumeWaiters(toWake)
   }
 
   private fun incrementFifoCounterBoundedLocked() {
@@ -455,17 +589,17 @@ class CoalescingCommandMailbox(
     return state.autosaveStatus is AutosaveStatus.Saved || state.autosaveStatus == AutosaveStatus.Idle
   }
 
-  private fun detachWaitersLocked(): List<CancellableContinuation<Unit>> {
+  private fun detachWaitersLocked(): List<CancellableContinuation<PollAttempt>> {
     if (waiters.isEmpty()) return emptyList()
     val snapshot = waiters.toList()
     waiters.clear()
     return snapshot
   }
 
-  private fun resumeWaiters(continuations: List<CancellableContinuation<Unit>>) {
+  private fun resumeWaiters(continuations: List<CancellableContinuation<PollAttempt>>) {
     for (cont in continuations) {
       if (cont.isActive) {
-        cont.resume(Unit)
+        cont.resume(PollAttempt.MustWait)
       }
     }
   }

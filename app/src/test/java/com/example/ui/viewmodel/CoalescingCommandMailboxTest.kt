@@ -9,6 +9,7 @@ import com.example.domain.model.NoteRecoveryDraftKeys
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import kotlin.concurrent.thread
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
@@ -18,6 +19,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.runTest
+import kotlinx.coroutines.withTimeout
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
@@ -658,6 +660,455 @@ class CoalescingCommandMailboxTest {
       assertFalse(raceMailbox.uiState.value.isSessionFullySynced)
     }
   }
+
+  @Test
+  fun receiveNext_raceBetweenFirstAttemptAndSubmitBeforeWaiterRegistration_deliversItemWithoutLoss() =
+    runBlocking {
+      val mailbox = CoalescingCommandMailbox()
+      val cmd1 = SessionCommand.EditTitle("Corrida-1")
+      val cmd2 = SessionCommand.InsertText("Corrida-2")
+      val enteredHook = CountDownLatch(1)
+      val submitFinished = CountDownLatch(1)
+
+      val producer =
+        thread(name = "race-submit-before-waiter") {
+          assertTrue(enteredHook.await(2, TimeUnit.SECONDS))
+          assertEquals(SubmitCommandResult.Accepted(1L), mailbox.submit(cmd1))
+          assertEquals(SubmitCommandResult.Accepted(2L), mailbox.submit(cmd2))
+          submitFinished.countDown()
+        }
+
+      mailbox.beforeSuspendRegistrationHook = {
+        mailbox.beforeSuspendRegistrationHook = null
+        enteredHook.countDown()
+        assertTrue(submitFinished.await(2, TimeUnit.SECONDS))
+        assertEquals(2, mailbox.fifoQueueSize)
+      }
+
+      // Primeira tentativa vê fila vazia; produtor insere cmd1/cmd2 antes da segunda tentativa atômica.
+      val firstReceived = withTimeout(2_000L) { mailbox.receiveNext() }
+      producer.join(2_000L)
+
+      assertEquals(MailboxItem.Command(QueuedSessionCommand(cmd1, 1L)), firstReceived)
+      assertEquals(1, mailbox.fifoQueueSize)
+
+      val secondReceived = withTimeout(2_000L) { mailbox.receiveNext() }
+      assertEquals(MailboxItem.Command(QueuedSessionCommand(cmd2, 2L)), secondReceived)
+      assertEquals(0, mailbox.fifoQueueSize)
+    }
+
+  @Test
+  fun receiveNext_raceBetweenFirstAttemptAndCloseBeforeWaiterRegistration_returnsNullWithoutHanging() =
+    runBlocking {
+      val mailbox = CoalescingCommandMailbox()
+      val enteredHook = CountDownLatch(1)
+      val closeFinished = CountDownLatch(1)
+
+      val closer =
+        thread(name = "race-close-before-waiter") {
+          assertTrue(enteredHook.await(2, TimeUnit.SECONDS))
+          mailbox.close()
+          closeFinished.countDown()
+        }
+
+      mailbox.beforeSuspendRegistrationHook = {
+        mailbox.beforeSuspendRegistrationHook = null
+        enteredHook.countDown()
+        assertTrue(closeFinished.await(2, TimeUnit.SECONDS))
+      }
+
+      // Primeira tentativa vê aberto e vazio; close() ocorre antes da segunda tentativa -> TerminalEmpty.
+      val item = withTimeout(2_000L) { mailbox.receiveNext() }
+      closer.join(2_000L)
+
+      assertNull(item)
+      assertTrue(mailbox.isClosed)
+    }
+
+  @Test
+  fun receiveNext_raceWithCompletionBeforeWaiterRegistration_deliversCompletionWithoutLoss() =
+    runBlocking {
+      val mailbox = CoalescingCommandMailbox()
+      val completion =
+        PersistenceCompletion.CheckpointUpsert(
+          operationId = 42L,
+          targetGeneration = 3L,
+          attemptedCheckpointRevision = 3L,
+          persistedCheckpointRevision = 3L,
+          checkpointAt = 1234L,
+        )
+      val enteredHook = CountDownLatch(1)
+      val enqueueFinished = CountDownLatch(1)
+
+      val worker =
+        thread(name = "race-completion-before-waiter") {
+          assertTrue(enteredHook.await(2, TimeUnit.SECONDS))
+          mailbox.enqueueCompletion(completion)
+          enqueueFinished.countDown()
+        }
+
+      mailbox.beforeSuspendRegistrationHook = {
+        mailbox.beforeSuspendRegistrationHook = null
+        enteredHook.countDown()
+        assertTrue(enqueueFinished.await(2, TimeUnit.SECONDS))
+      }
+
+      val received = withTimeout(2_000L) { mailbox.receiveNext() }
+      worker.join(2_000L)
+
+      assertEquals(MailboxItem.Completion(completion), received)
+      assertEquals(0, mailbox.pendingCompletionsSize)
+    }
+
+  @Test
+  fun close_withActiveBarrierAndRetainedFifo_awaitsControlledReleasePreservesOrderAndTerminates() =
+    runBlocking {
+      val mailbox = CoalescingCommandMailbox()
+      val token = mailbox.enterBarrier(BarrierReason.CONSOLIDATION)
+      val cmd1 = SessionCommand.EditTitle("Retido-1")
+      val cmd2 = SessionCommand.InsertText("Retido-2")
+      val cmd3 = SessionCommand.TogglePinned
+
+      assertEquals(SubmitCommandResult.Accepted(1L), mailbox.submit(cmd1))
+      assertEquals(SubmitCommandResult.Accepted(2L), mailbox.submit(cmd2))
+      assertEquals(SubmitCommandResult.Accepted(3L), mailbox.submit(cmd3))
+      assertEquals(3, mailbox.fifoQueueSize)
+      assertEquals(0, mailbox.pendingCompletionsSize)
+
+      mailbox.close()
+      assertTrue(mailbox.isClosed)
+      assertTrue(mailbox.barrierActive)
+
+      // Novos comandos após close() são rejeitados mesmo com barreira ativa
+      val rejectedAck = CompletableDeferred<SessionCommandOutcome>()
+      assertEquals(
+        SubmitCommandResult.Rejected(SubmitRejectionReason.MAILBOX_CLOSED),
+        mailbox.submit(SessionCommand.InsertText("Apos-Close")),
+      )
+      assertEquals(
+        SubmitCommandResult.Rejected(SubmitRejectionReason.MAILBOX_CLOSED),
+        mailbox.submit(SessionCommand.FlushAutosave(ackDeferred = rejectedAck)),
+      )
+      assertEquals(
+        SessionCommandOutcome.Rejected(SubmitRejectionReason.MAILBOX_CLOSED),
+        withTimeout(2_000L) { rejectedAck.await() },
+      )
+      assertEquals(3L, mailbox.acceptedMutationSequence)
+
+      // Token inválido não desbloqueia a barreira durante o encerramento
+      val forgedToken = BarrierToken(id = token.id + 100L, reason = BarrierReason.CONSOLIDATION)
+      assertFalse(mailbox.releaseBarrier(forgedToken))
+      assertFalse(mailbox.closeAndReleaseBarrier(forgedToken))
+      assertTrue(mailbox.barrierActive)
+
+      val delivered = mutableListOf<MailboxItem>()
+      val waiterRegistered = CountDownLatch(1)
+      val completionDelivered = CompletableDeferred<Unit>()
+      val consumer =
+        async(Dispatchers.Default) {
+          mailbox.beforeSuspendRegistrationHook = {
+            mailbox.beforeSuspendRegistrationHook = null
+            waiterRegistered.countDown()
+          }
+          while (true) {
+            val next = mailbox.receiveNext() ?: break
+            delivered.add(next)
+            if (next is MailboxItem.Completion) {
+              completionDelivered.complete(Unit)
+            }
+          }
+        }
+
+      // Garante que o consumidor entrou em espera controlada enquanto a barreira está ativa
+      assertTrue(waiterRegistered.await(2, TimeUnit.SECONDS))
+      assertEquals(3, mailbox.fifoQueueSize)
+      assertTrue(delivered.isEmpty())
+
+      // A operação estrutural em curso ainda conclui após close() e é entregue antes da FIFO
+      val structuralCompletion =
+        PersistenceCompletion.StructuralOperation(
+          operationId = 77L,
+          barrierToken = token,
+          succeeded = true,
+          terminal = false,
+        )
+      mailbox.enqueueCompletion(structuralCompletion)
+      withTimeout(2_000L) { completionDelivered.await() }
+      assertEquals(3, mailbox.fifoQueueSize)
+      assertTrue(mailbox.barrierActive)
+
+      // Liberação controlada com o token legítimo destrava a FIFO retida e conclui sem deadlock
+      assertTrue(mailbox.releaseBarrier(token))
+      assertFalse(mailbox.barrierActive)
+
+      withTimeout(2_000L) { consumer.await() }
+
+      assertEquals(4, delivered.size)
+      assertEquals(MailboxItem.Completion(structuralCompletion), delivered[0])
+      assertEquals(MailboxItem.Command(QueuedSessionCommand(cmd1, 1L)), delivered[1])
+      assertEquals(MailboxItem.Command(QueuedSessionCommand(cmd2, 2L)), delivered[2])
+      assertEquals(MailboxItem.Command(QueuedSessionCommand(cmd3, 3L)), delivered[3])
+      assertEquals(0, mailbox.fifoQueueSize)
+      assertEquals(0, mailbox.pendingCompletionsSize)
+    }
+
+  @Test
+  fun closeAndReleaseBarrier_withActiveBarrierAndRetainedFifo_unlocksDrainsAndTerminatesWithoutDeadlock() =
+    runBlocking {
+      val mailbox = CoalescingCommandMailbox()
+      val token = mailbox.enterBarrier(BarrierReason.DISCARD_DRAFT)
+      val cmd1 = SessionCommand.InsertText("Antes-1")
+      val cmd2 = SessionCommand.InsertText("Antes-2")
+      assertEquals(SubmitCommandResult.Accepted(1L), mailbox.submit(cmd1))
+      assertEquals(SubmitCommandResult.Accepted(2L), mailbox.submit(cmd2))
+
+      val delivered = mutableListOf<MailboxItem>()
+      val consumerWaiting = CountDownLatch(1)
+      val consumer =
+        async(Dispatchers.Default) {
+          mailbox.beforeSuspendRegistrationHook = {
+            mailbox.beforeSuspendRegistrationHook = null
+            consumerWaiting.countDown()
+          }
+          while (true) {
+            val next = mailbox.receiveNext() ?: break
+            delivered.add(next)
+          }
+        }
+
+      assertTrue(consumerWaiting.await(2, TimeUnit.SECONDS))
+
+      // Token divergente fecha a aceitação, mas NÃO libera a barreira indevidamente
+      val wrongToken = BarrierToken(id = token.id + 50L, reason = BarrierReason.DISCARD_DRAFT)
+      assertFalse(mailbox.closeAndReleaseBarrier(wrongToken))
+      assertTrue(mailbox.isClosed)
+      assertTrue(mailbox.barrierActive)
+      assertEquals(2, mailbox.fifoQueueSize)
+
+      // Token legítimo libera atomicamente a barreira e acorda o consumidor para drenar FIFO e encerrar
+      assertTrue(mailbox.closeAndReleaseBarrier(token))
+      assertFalse(mailbox.barrierActive)
+      withTimeout(2_000L) { consumer.await() }
+
+      assertEquals(
+        listOf(
+          MailboxItem.Command(QueuedSessionCommand(cmd1, 1L)),
+          MailboxItem.Command(QueuedSessionCommand(cmd2, 2L)),
+        ),
+        delivered,
+      )
+      assertEquals(
+        SubmitCommandResult.Rejected(SubmitRejectionReason.MAILBOX_CLOSED),
+        mailbox.submit(SessionCommand.EditTitle("Rejeitado")),
+      )
+    }
+
+  @Test
+  fun close_withActiveBarrierAndEmptyQueues_waitsForStructuralCompletionBeforeReturningNull() =
+    runBlocking {
+      val mailbox = CoalescingCommandMailbox()
+      val token = mailbox.enterBarrier(BarrierReason.CONFLICT_RESOLUTION)
+      mailbox.close()
+
+      val consumerWaiting = CountDownLatch(1)
+      val received = mutableListOf<MailboxItem>()
+      val consumer =
+        async(Dispatchers.Default) {
+          mailbox.beforeSuspendRegistrationHook = {
+            mailbox.beforeSuspendRegistrationHook = null
+            consumerWaiting.countDown()
+          }
+          while (true) {
+            val item = mailbox.receiveNext() ?: break
+            received.add(item)
+          }
+        }
+
+      assertTrue(consumerWaiting.await(2, TimeUnit.SECONDS))
+      assertTrue(consumer.isActive)
+
+      val completion =
+        PersistenceCompletion.StructuralOperation(
+          operationId = 88L,
+          barrierToken = token,
+          succeeded = true,
+          terminal = true,
+        )
+      mailbox.enqueueCompletion(completion)
+      assertTrue(mailbox.releaseBarrier(token))
+
+      withTimeout(2_000L) { consumer.await() }
+      assertEquals(listOf(MailboxItem.Completion(completion)), received)
+    }
+
+  @Test
+  fun receiveNext_concurrentCancellationDuringSecondAttempt_requeuesItemWithoutLoss() =
+    runBlocking {
+      val mailbox = CoalescingCommandMailbox()
+      val cmd1 = SessionCommand.EditTitle("Preservado-no-cancelamento")
+      val cmd2 = SessionCommand.InsertText("Posterior")
+      val hookEntered = CountDownLatch(1)
+      val allowHookExit = CountDownLatch(1)
+
+      mailbox.beforeSuspendRegistrationHook = {
+        mailbox.beforeSuspendRegistrationHook = null
+        hookEntered.countDown()
+        assertTrue(allowHookExit.await(2, TimeUnit.SECONDS))
+      }
+
+      val cancelledConsumer =
+        launch(Dispatchers.Default) {
+          mailbox.receiveNext()
+        }
+
+      assertTrue(hookEntered.await(2, TimeUnit.SECONDS))
+      assertEquals(SubmitCommandResult.Accepted(1L), mailbox.submit(cmd1))
+      assertEquals(SubmitCommandResult.Accepted(2L), mailbox.submit(cmd2))
+      cancelledConsumer.cancel()
+      allowHookExit.countDown()
+      withTimeout(2_000L) { cancelledConsumer.join() }
+
+      // Mesmo cancelada durante a janela da segunda tentativa, cmd1 e cmd2 permanecem intactos na ordem exata
+      assertEquals(2, mailbox.fifoQueueSize)
+      val first = withTimeout(2_000L) { mailbox.receiveNext() }
+      val second = withTimeout(2_000L) { mailbox.receiveNext() }
+      assertEquals(MailboxItem.Command(QueuedSessionCommand(cmd1, 1L)), first)
+      assertEquals(MailboxItem.Command(QueuedSessionCommand(cmd2, 2L)), second)
+      assertEquals(0, mailbox.fifoQueueSize)
+    }
+
+  @Test
+  fun receiveNext_cancellationAfterImmediateResumeBeforeDelivery_triggersOnCancellationAndRequeuesWithoutLossOrDuplication() =
+    runBlocking {
+      val mailbox = CoalescingCommandMailbox()
+      val cmd1 = SessionCommand.EditTitle("Item-1-Requeue")
+      val cmd2 = SessionCommand.InsertText("Item-2-Ordem")
+      val beforeSuspendEntered = CountDownLatch(1)
+      val allowBeforeSuspendExit = CountDownLatch(1)
+      val afterResumeEntered = CountDownLatch(1)
+      val allowAfterResumeExit = CountDownLatch(1)
+
+      var deliveredToOriginal: MailboxItem? = null
+      var cancellationObserved = false
+
+      mailbox.beforeSuspendRegistrationHook = {
+        mailbox.beforeSuspendRegistrationHook = null
+        beforeSuspendEntered.countDown()
+        assertTrue(allowBeforeSuspendExit.await(2, TimeUnit.SECONDS))
+      }
+      mailbox.afterImmediateResumeHook = {
+        mailbox.afterImmediateResumeHook = null
+        afterResumeEntered.countDown()
+        assertTrue(allowAfterResumeExit.await(2, TimeUnit.SECONDS))
+      }
+
+      val originalConsumer =
+        launch(Dispatchers.Default) {
+          try {
+            deliveredToOriginal = mailbox.receiveNext()
+          } catch (cancelled: CancellationException) {
+            cancellationObserved = true
+            throw cancelled
+          }
+        }
+
+      // 1. Aguarda a primeira tentativa ver fila vazia e pausar antes do registro em waiters
+      assertTrue(beforeSuspendEntered.await(2, TimeUnit.SECONDS))
+      assertEquals(SubmitCommandResult.Accepted(1L), mailbox.submit(cmd1))
+      assertEquals(SubmitCommandResult.Accepted(2L), mailbox.submit(cmd2))
+      assertEquals(2, mailbox.fifoQueueSize)
+
+      // 2. Libera para executar a segunda tentativa, retirar cmd1 e chamar cont.resume(resolved) ativo
+      allowBeforeSuspendExit.countDown()
+      assertTrue(afterResumeEntered.await(2, TimeUnit.SECONDS))
+
+      // Nesse ponto exato: cmd1 já foi retirado da fila (fifoQueueSize == 1), cont.resume(resolved)
+      // já foi invocado, mas suspendCancellableCoroutine ainda não entregou o valor ao consumidor.
+      assertEquals(1, mailbox.fifoQueueSize)
+
+      // 3. Cancela o consumidor nessa janela e libera o retorno da continuação
+      originalConsumer.cancel()
+      allowAfterResumeExit.countDown()
+      withTimeout(2_000L) { originalConsumer.join() }
+
+      // Verifica cancelamento efetivo, ausência de entrega ao consumidor cancelado e requeue via onCancellation
+      assertTrue(originalConsumer.isCancelled)
+      assertTrue(cancellationObserved)
+      assertNull(deliveredToOriginal)
+      assertEquals(2, mailbox.fifoQueueSize)
+
+      // 4. Novo consumidor recebe cmd1 primeiro, depois cmd2, sem perda nem duplicação
+      val firstReceived = withTimeout(2_000L) { mailbox.receiveNext() }
+      val secondReceived = withTimeout(2_000L) { mailbox.receiveNext() }
+      mailbox.close()
+      val terminal = withTimeout(2_000L) { mailbox.receiveNext() }
+
+      assertEquals(MailboxItem.Command(QueuedSessionCommand(cmd1, 1L)), firstReceived)
+      assertEquals(MailboxItem.Command(QueuedSessionCommand(cmd2, 2L)), secondReceived)
+      assertNull(terminal)
+      assertEquals(0, mailbox.fifoQueueSize)
+    }
+
+  @Test
+  fun closeAndReleaseBarrier_onlyAfterDefinitiveStructuralCompletion_preservesOperationAndDrainsFifo() =
+    runBlocking {
+      val mailbox = CoalescingCommandMailbox()
+      val token = mailbox.enterBarrier(BarrierReason.CONSOLIDATION)
+      val retainedCmd = SessionCommand.InsertText("Edicao-pendente")
+      assertEquals(SubmitCommandResult.Accepted(1L), mailbox.submit(retainedCmd))
+
+      val delivered = mutableListOf<MailboxItem>()
+      val structuralCompletedSignal = CompletableDeferred<Unit>()
+      val waiterRegistered = CountDownLatch(1)
+
+      val consumer =
+        async(Dispatchers.Default) {
+          mailbox.beforeSuspendRegistrationHook = {
+            mailbox.beforeSuspendRegistrationHook = null
+            waiterRegistered.countDown()
+          }
+          while (true) {
+            val item = mailbox.receiveNext() ?: break
+            delivered.add(item)
+            if (item is MailboxItem.Completion) {
+              structuralCompletedSignal.complete(Unit)
+            }
+          }
+        }
+
+      assertTrue(waiterRegistered.await(2, TimeUnit.SECONDS))
+
+      // Enquanto a operação estrutural não concluiu definitivamente, close() NÃO quebra a barreira
+      mailbox.close()
+      assertTrue(mailbox.isClosed)
+      assertTrue(mailbox.barrierActive)
+      assertEquals(1, mailbox.fifoQueueSize)
+
+      // Operação estrutural conclui definitivamente -> consumidor recebe a conclusão com prioridade
+      val completion =
+        PersistenceCompletion.StructuralOperation(
+          operationId = 99L,
+          barrierToken = token,
+          succeeded = true,
+          terminal = false,
+        )
+      mailbox.enqueueCompletion(completion)
+      withTimeout(2_000L) { structuralCompletedSignal.await() }
+      assertTrue(mailbox.barrierActive)
+
+      // Somente após o término definitivo da operação estrutural o detentor chama closeAndReleaseBarrier(token)
+      assertTrue(mailbox.closeAndReleaseBarrier(token))
+      assertFalse(mailbox.barrierActive)
+
+      withTimeout(2_000L) { consumer.await() }
+      assertEquals(
+        listOf(
+          MailboxItem.Completion(completion),
+          MailboxItem.Command(QueuedSessionCommand(retainedCmd, 1L)),
+        ),
+        delivered,
+      )
+    }
 
   private fun CoalescingCommandMailbox.submitAndConsumeAsSynced(generation: Long, seqCount: Int) {
     val startApplied = appliedMutationSequence
