@@ -4,7 +4,9 @@ import com.example.domain.editor.NoteEditorSessionIdentity
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.CyclicBarrier
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReference
 import kotlin.concurrent.thread
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -704,5 +706,189 @@ class ActiveSessionRegistryTest {
 
     assertEquals(CommitTransferResult.RejectedAlreadyRolledBack, registry.commitIdentityTransfer(originalToken))
     assertEquals(RollbackTransferResult.AlreadyRolledBack, registry.rollbackIdentityTransfer(originalToken))
+  }
+
+  @Test
+  fun reserveAndCommitIdentityTransfer_downgradeCheckpointToWithoutCheckpointSameSession_freesDraftOnly() {
+    val registry = ActiveSessionRegistry()
+    val sourceIdentity =
+      RegisteredSessionIdentity(sessionId = "shared-down", draftId = "note_8_shared-down", targetNoteId = 8L)
+    val targetIdentity =
+      RegisteredSessionIdentity.withoutCheckpoint(sessionId = "shared-down", targetNoteId = 8L)
+
+    val sourceLease =
+      (registry.reserve(sourceIdentity) as SessionReservationResult.Reserved).lease
+    val token =
+      (registry.reserveIdentityTransfer(sourceLease, targetIdentity) as ReserveTransferResult.Reserved)
+        .transferToken
+
+    assertTrue(registry.isSessionReserved("shared-down"))
+    assertTrue(registry.isDraftReserved("note_8_shared-down"))
+
+    val commit = registry.commitIdentityTransfer(token) as CommitTransferResult.Committed
+    assertFalse(registry.isLeaseActive(sourceLease))
+    assertTrue(registry.isLeaseActive(commit.newLease))
+    assertTrue(registry.isSessionReserved("shared-down"))
+    assertFalse(registry.isDraftReserved("note_8_shared-down"))
+    assertEquals(0, registry.snapshot().pendingTransferCount)
+  }
+
+  @Test
+  fun concurrentCommitAndRollbackOnSameToken_enforcesSingleWinnerAndConsistentIdempotency() {
+    repeat(20) { iteration ->
+      val registry = ActiveSessionRegistry()
+      val sourceIdentity =
+        RegisteredSessionIdentity(
+          sessionId = "race-src-$iteration",
+          draftId = "note_${iteration + 1}_race-src-$iteration",
+          targetNoteId = (iteration + 1).toLong(),
+        )
+      val targetIdentity =
+        RegisteredSessionIdentity(
+          sessionId = "race-dst-$iteration",
+          draftId = "new_race-dst-$iteration",
+          targetNoteId = null,
+        )
+
+      val sourceLease =
+        (registry.reserve(sourceIdentity) as SessionReservationResult.Reserved).lease
+      val token =
+        (registry.reserveIdentityTransfer(sourceLease, targetIdentity) as ReserveTransferResult.Reserved)
+          .transferToken
+
+      val workers = 8
+      val barrier = CyclicBarrier(workers)
+      val done = CountDownLatch(workers)
+      val committedWins = AtomicInteger(0)
+      val alreadyCommitted = AtomicInteger(0)
+      val rejectedAlreadyRolledBack = AtomicInteger(0)
+      val rolledBackWins = AtomicInteger(0)
+      val alreadyRolledBack = AtomicInteger(0)
+      val rejectedAlreadyCommitted = AtomicInteger(0)
+      val unexpected = AtomicInteger(0)
+
+      repeat(workers) { idx ->
+        thread {
+          try {
+            barrier.await(5, TimeUnit.SECONDS)
+            if (idx % 2 == 0) {
+              when (registry.commitIdentityTransfer(token)) {
+                is CommitTransferResult.Committed -> committedWins.incrementAndGet()
+                is CommitTransferResult.AlreadyCommitted -> alreadyCommitted.incrementAndGet()
+                CommitTransferResult.RejectedAlreadyRolledBack -> rejectedAlreadyRolledBack.incrementAndGet()
+                CommitTransferResult.InvalidOrObsoleteToken -> unexpected.incrementAndGet()
+              }
+            } else {
+              when (registry.rollbackIdentityTransfer(token)) {
+                is RollbackTransferResult.RolledBack -> rolledBackWins.incrementAndGet()
+                RollbackTransferResult.AlreadyRolledBack -> alreadyRolledBack.incrementAndGet()
+                RollbackTransferResult.RejectedAlreadyCommitted -> rejectedAlreadyCommitted.incrementAndGet()
+                RollbackTransferResult.InvalidOrObsoleteToken -> unexpected.incrementAndGet()
+              }
+            }
+          } finally {
+            done.countDown()
+          }
+        }
+      }
+
+      assertTrue(done.await(10, TimeUnit.SECONDS))
+      assertEquals(0, unexpected.get())
+      assertEquals(0, registry.snapshot().pendingTransferCount)
+      assertEquals(1, committedWins.get() + rolledBackWins.get())
+
+      if (committedWins.get() == 1) {
+        assertEquals(workers / 2 - 1, alreadyCommitted.get())
+        assertEquals(0, rejectedAlreadyRolledBack.get())
+        assertEquals(0, rolledBackWins.get())
+        assertEquals(0, alreadyRolledBack.get())
+        assertEquals(workers / 2, rejectedAlreadyCommitted.get())
+
+        assertFalse(registry.isLeaseActive(sourceLease))
+        assertFalse(registry.isSessionReserved(sourceIdentity.sessionId))
+        assertFalse(registry.isDraftReserved(sourceIdentity.draftId!!))
+        assertTrue(registry.isSessionReserved(targetIdentity.sessionId))
+        assertTrue(registry.isDraftReserved(targetIdentity.draftId!!))
+      } else {
+        assertEquals(1, rolledBackWins.get())
+        assertEquals(workers / 2 - 1, alreadyRolledBack.get())
+        assertEquals(0, rejectedAlreadyCommitted.get())
+        assertEquals(0, committedWins.get())
+        assertEquals(0, alreadyCommitted.get())
+        assertEquals(workers / 2, rejectedAlreadyRolledBack.get())
+
+        assertTrue(registry.isLeaseActive(sourceLease))
+        assertTrue(registry.isSessionReserved(sourceIdentity.sessionId))
+        assertTrue(registry.isDraftReserved(sourceIdentity.draftId!!))
+        assertFalse(registry.isSessionReserved(targetIdentity.sessionId))
+        assertFalse(registry.isDraftReserved(targetIdentity.draftId!!))
+      }
+    }
+  }
+
+  @Test
+  fun concurrentReleaseSourceAndCommitTransfer_neverLeavesOrphanedKeysOrInconsistentLeases() {
+    repeat(20) { iteration ->
+      val registry = ActiveSessionRegistry()
+      val sourceIdentity =
+        RegisteredSessionIdentity(
+          sessionId = "rel-race-src-$iteration",
+          draftId = "note_${iteration + 100}_rel-race-src-$iteration",
+          targetNoteId = (iteration + 100).toLong(),
+        )
+      val targetIdentity =
+        RegisteredSessionIdentity(
+          sessionId = "rel-race-dst-$iteration",
+          draftId = "new_rel-race-dst-$iteration",
+          targetNoteId = null,
+        )
+
+      val sourceLease =
+        (registry.reserve(sourceIdentity) as SessionReservationResult.Reserved).lease
+      val token =
+        (registry.reserveIdentityTransfer(sourceLease, targetIdentity) as ReserveTransferResult.Reserved)
+          .transferToken
+
+      val barrier = CyclicBarrier(2)
+      val done = CountDownLatch(2)
+      val releaseWon = AtomicBoolean(false)
+      val commitOutcome = AtomicReference<CommitTransferResult?>(null)
+
+      thread {
+        try {
+          barrier.await(5, TimeUnit.SECONDS)
+          releaseWon.set(registry.release(sourceLease))
+        } finally {
+          done.countDown()
+        }
+      }
+      thread {
+        try {
+          barrier.await(5, TimeUnit.SECONDS)
+          commitOutcome.set(registry.commitIdentityTransfer(token))
+        } finally {
+          done.countDown()
+        }
+      }
+
+      assertTrue(done.await(10, TimeUnit.SECONDS))
+      assertEquals(0, registry.snapshot().pendingTransferCount)
+      assertFalse(registry.isLeaseActive(sourceLease))
+      assertFalse(registry.isSessionReserved(sourceIdentity.sessionId))
+      assertFalse(registry.isDraftReserved(sourceIdentity.draftId!!))
+
+      val finalCommit = commitOutcome.get()
+      if (releaseWon.get()) {
+        assertEquals(CommitTransferResult.RejectedAlreadyRolledBack, finalCommit)
+        assertFalse(registry.isSessionReserved(targetIdentity.sessionId))
+        assertFalse(registry.isDraftReserved(targetIdentity.draftId!!))
+      } else {
+        assertTrue(finalCommit is CommitTransferResult.Committed)
+        val newLease = (finalCommit as CommitTransferResult.Committed).newLease
+        assertTrue(registry.isLeaseActive(newLease))
+        assertTrue(registry.isSessionReserved(targetIdentity.sessionId))
+        assertTrue(registry.isDraftReserved(targetIdentity.draftId!!))
+      }
+    }
   }
 }

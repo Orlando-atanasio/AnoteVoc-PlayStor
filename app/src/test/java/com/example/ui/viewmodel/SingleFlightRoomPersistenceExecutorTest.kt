@@ -2004,6 +2004,287 @@ class SingleFlightRoomPersistenceExecutorTest {
       assertTrue(identicalRetry.snapshot.isSyncConfirmationAllowed)
     }
 
+  @Test
+  fun concurrentReplaceWithSaveAndDelete_serializeInFifoAndRejectOldIdentityAfterSwitchWithoutRepoIo() =
+    runBlocking {
+      val draftRepo = FakeDraftRepository()
+      val noteRepo = FakeNoteRepository()
+      val oldIdentity = existingNoteIdentity(noteId = 61L, sessionId = "old-61")
+      val newIdentity = newNoteIdentity("new-61")
+      draftRepo.seedDraft(oldIdentity.draftId, oldIdentity.sessionId, 61L, "original-61", 2L)
+
+      val executor =
+        SingleFlightRoomPersistenceExecutor(
+          draftRepository = draftRepo,
+          noteRepository = noteRepo,
+          initialIdentity = oldIdentity,
+          initialPresence = CheckpointPresence.PRESENT,
+          initialConfirmedRevision = 2L,
+        )
+
+      val replaceEntered = CompletableDeferred<Unit>()
+      val replaceRelease = CompletableDeferred<Unit>()
+      draftRepo.onReplaceHook = {
+        replaceEntered.complete(Unit)
+        replaceRelease.await()
+      }
+
+      val newPayload = payloadFor(newIdentity, title = "convertida-61", baseRevision = 0L, baseNoteUpdatedAt = null)
+      val replaceJob =
+        async(Dispatchers.Default) {
+          executor.replaceCheckpointWithNewNote(
+            oldDraftId = oldIdentity.draftId,
+            expectedOldSessionId = oldIdentity.sessionId,
+            expectedOldTargetNoteId = 61L,
+            newPayload = newPayload,
+          )
+        }
+
+      withTimeout(5_000) { replaceEntered.await() }
+      assertTrue(executor.snapshot().hasInFlightOperation)
+      assertTrue(executor.snapshot().hasPendingReplacement)
+      assertEquals(1, draftRepo.maxConcurrentCalls.get())
+
+      val queuedSave =
+        async(start = CoroutineStart.UNDISPATCHED) {
+          runCatching { executor.saveCheckpoint(payloadFor(oldIdentity, title = "save-concorrente-antigo")) }
+        }
+      val queuedDelete =
+        async(start = CoroutineStart.UNDISPATCHED) {
+          runCatching { executor.deleteCheckpoint(oldIdentity.draftId) }
+        }
+      val queuedSecondReplace =
+        async(start = CoroutineStart.UNDISPATCHED) {
+          runCatching {
+            executor.replaceCheckpointWithNewNote(
+              oldDraftId = oldIdentity.draftId,
+              expectedOldSessionId = oldIdentity.sessionId,
+              expectedOldTargetNoteId = 61L,
+              newPayload = payloadFor(newNoteIdentity("new-61-b"), title = "outra", baseRevision = 0L, baseNoteUpdatedAt = null),
+            )
+          }
+        }
+
+      // Nenhuma chamada concorrente entra no repositório enquanto replace estiver em voo.
+      assertEquals(listOf("replaceCheckpoint:${oldIdentity.draftId}->${newIdentity.draftId}"), draftRepo.callLog)
+
+      replaceRelease.complete(Unit)
+
+      val replaceResult = withTimeout(5_000) { replaceJob.await() }
+      assertTrue(replaceResult is ReplaceCheckpointExecutionResult.Replaced)
+      assertEquals(newIdentity.draftId, replaceResult.snapshot.draftId)
+
+      val saveOutcome = withTimeout(5_000) { queuedSave.await() }
+      val deleteOutcome = withTimeout(5_000) { queuedDelete.await() }
+      val secondReplaceOutcome = withTimeout(5_000) { queuedSecondReplace.await() }
+
+      assertTrue(saveOutcome.exceptionOrNull() is IllegalArgumentException)
+      assertTrue(deleteOutcome.exceptionOrNull() is IllegalArgumentException)
+      assertTrue(secondReplaceOutcome.exceptionOrNull() is IllegalArgumentException)
+      assertEquals(1, draftRepo.maxConcurrentCalls.get())
+      assertEquals(listOf("replaceCheckpoint:${oldIdentity.draftId}->${newIdentity.draftId}"), draftRepo.callLog)
+      assertFalse(executor.snapshot().hasInFlightOperation)
+      assertEquals(CheckpointPresence.PRESENT, executor.snapshot().checkpointPresence)
+    }
+
+  @Test
+  fun concurrentIdenticalRetriesAfterIndeterminateFailure_serializeSafelyWithoutConcurrentRepoCalls() =
+    runBlocking {
+      val draftRepo = FakeDraftRepository()
+      val noteRepo = FakeNoteRepository()
+      val oldIdentity = existingNoteIdentity(noteId = 62L, sessionId = "old-62")
+      val newIdentity = newNoteIdentity("new-62")
+      draftRepo.seedDraft(oldIdentity.draftId, oldIdentity.sessionId, 62L, "original-62", 2L)
+
+      val executor =
+        SingleFlightRoomPersistenceExecutor(
+          draftRepository = draftRepo,
+          noteRepository = noteRepo,
+          initialIdentity = oldIdentity,
+          initialPresence = CheckpointPresence.PRESENT,
+          initialConfirmedRevision = 2L,
+        )
+
+      val newPayload = payloadFor(newIdentity, title = "copia-62", baseRevision = 0L, baseNoteUpdatedAt = null)
+      draftRepo.failAfterReplaceCommit = true
+      val initialFailure =
+        executor.replaceCheckpointWithNewNote(
+          oldDraftId = oldIdentity.draftId,
+          expectedOldSessionId = oldIdentity.sessionId,
+          expectedOldTargetNoteId = 62L,
+          newPayload = newPayload,
+        )
+      assertTrue(initialFailure is ReplaceCheckpointExecutionResult.Failed)
+      assertTrue(initialFailure.snapshot.hasPendingReplacement)
+
+      draftRepo.failAfterReplaceCommit = false
+      val retryEntered = CompletableDeferred<Unit>()
+      val retryRelease = CompletableDeferred<Unit>()
+      draftRepo.onReplaceHook = {
+        retryEntered.complete(Unit)
+        retryRelease.await()
+      }
+
+      val retry1 =
+        async(Dispatchers.Default) {
+          executor.replaceCheckpointWithNewNote(
+            oldDraftId = oldIdentity.draftId,
+            expectedOldSessionId = oldIdentity.sessionId,
+            expectedOldTargetNoteId = 62L,
+            newPayload = newPayload,
+          )
+        }
+
+      withTimeout(5_000) { retryEntered.await() }
+      assertEquals(1, draftRepo.maxConcurrentCalls.get())
+
+      // Segunda tentativa idêntica chega enquanto a primeira ainda está em voo.
+      val retry2 =
+        async(start = CoroutineStart.UNDISPATCHED) {
+          runCatching {
+            executor.replaceCheckpointWithNewNote(
+              oldDraftId = oldIdentity.draftId,
+              expectedOldSessionId = oldIdentity.sessionId,
+              expectedOldTargetNoteId = 62L,
+              newPayload = newPayload,
+            )
+          }
+        }
+
+      retryRelease.complete(Unit)
+
+      val res1 = withTimeout(5_000) { retry1.await() }
+      assertTrue(res1 is ReplaceCheckpointExecutionResult.AlreadyReplaced)
+      assertEquals(newIdentity.draftId, res1.snapshot.draftId)
+      assertFalse(res1.snapshot.hasPendingReplacement)
+
+      // Ao adquirir o mutex após retry1 resolver a pendência e trocar a identidade, retry2 rejeita oldIdentity.
+      val res2 = withTimeout(5_000) { retry2.await() }
+      assertTrue(res2.exceptionOrNull() is IllegalArgumentException)
+      assertEquals(1, draftRepo.maxConcurrentCalls.get())
+      assertEquals(newIdentity.draftId, executor.snapshot().draftId)
+      assertTrue(executor.snapshot().isSyncConfirmationAllowed)
+    }
+
+  @Test
+  fun cancellationOfQueuedReplaceBeforeMutexAcquisition_preservesStateAndDoesNotSetPendingReplacement() =
+    runBlocking {
+      val draftRepo = FakeDraftRepository()
+      val noteRepo = FakeNoteRepository()
+      val oldIdentity = existingNoteIdentity(noteId = 63L, sessionId = "old-63")
+      val newIdentity = newNoteIdentity("new-63")
+
+      val executor =
+        SingleFlightRoomPersistenceExecutor(
+          draftRepository = draftRepo,
+          noteRepository = noteRepo,
+          initialIdentity = oldIdentity,
+          initialPresence = CheckpointPresence.ABSENT,
+        )
+
+      val saveEntered = CompletableDeferred<Unit>()
+      val saveRelease = CompletableDeferred<Unit>()
+      draftRepo.onSaveHook = { input ->
+        if (input.title == "v1-holder") {
+          saveEntered.complete(Unit)
+          saveRelease.await()
+        }
+      }
+
+      val holder =
+        async(Dispatchers.Default) {
+          executor.saveCheckpoint(payloadFor(oldIdentity, title = "v1-holder"))
+        }
+      withTimeout(5_000) { saveEntered.await() }
+
+      val queuedReplace =
+        launch(start = CoroutineStart.UNDISPATCHED) {
+          executor.replaceCheckpointWithNewNote(
+            oldDraftId = oldIdentity.draftId,
+            expectedOldSessionId = oldIdentity.sessionId,
+            expectedOldTargetNoteId = 63L,
+            newPayload = payloadFor(newIdentity, title = "cancelada-fila", baseRevision = 0L, baseNoteUpdatedAt = null),
+          )
+        }
+
+      queuedReplace.cancelAndJoin()
+      assertTrue(queuedReplace.isCancelled)
+      assertFalse(executor.snapshot().hasPendingReplacement)
+      assertNull(executor.snapshot().pendingReplacement)
+
+      saveRelease.complete(Unit)
+      val saveResult = withTimeout(5_000) { holder.await() }
+      assertTrue(saveResult is SaveCheckpointExecutionResult.Saved)
+
+      val snap = executor.snapshot()
+      assertEquals(oldIdentity.draftId, snap.draftId)
+      assertEquals(CheckpointPresence.PRESENT, snap.checkpointPresence)
+      assertFalse(snap.hasPendingReplacement)
+      assertFalse(snap.hasInFlightOperation)
+      assertEquals(listOf("saveCheckpoint:v1-holder"), draftRepo.callLog)
+    }
+
+  @Test
+  fun queuedSaveBehindDeterministicallyRejectedReplace_reconcilesUnknownAndResumesMonotonically() =
+    runBlocking {
+      val draftRepo = FakeDraftRepository()
+      val noteRepo = FakeNoteRepository()
+      val oldIdentity = existingNoteIdentity(noteId = 64L, sessionId = "old-64")
+      val collidingSession = "collide-64"
+      val newIdentity = newNoteIdentity(collidingSession)
+      val blockerIdentity = existingNoteIdentity(noteId = 164L, sessionId = collidingSession)
+
+      draftRepo.seedDraft(oldIdentity.draftId, oldIdentity.sessionId, 64L, "original-64", 3L)
+      draftRepo.seedDraft(blockerIdentity.draftId, blockerIdentity.sessionId, 164L, "blocker-64", 1L)
+
+      val executor =
+        SingleFlightRoomPersistenceExecutor(
+          draftRepository = draftRepo,
+          noteRepository = noteRepo,
+          initialIdentity = oldIdentity,
+          initialPresence = CheckpointPresence.PRESENT,
+          initialConfirmedRevision = 3L,
+        )
+
+      val replaceEntered = CompletableDeferred<Unit>()
+      val replaceRelease = CompletableDeferred<Unit>()
+      draftRepo.onReplaceHook = {
+        replaceEntered.complete(Unit)
+        replaceRelease.await()
+      }
+
+      val replaceJob =
+        async(Dispatchers.Default) {
+          executor.replaceCheckpointWithNewNote(
+            oldDraftId = oldIdentity.draftId,
+            expectedOldSessionId = oldIdentity.sessionId,
+            expectedOldTargetNoteId = 64L,
+            newPayload = payloadFor(newIdentity, title = "rejeitada-fifo", baseRevision = 0L, baseNoteUpdatedAt = null),
+          )
+        }
+
+      withTimeout(5_000) { replaceEntered.await() }
+      val queuedSave =
+        async(start = CoroutineStart.UNDISPATCHED) {
+          executor.saveCheckpoint(payloadFor(oldIdentity, title = "save-apos-rejeicao"))
+        }
+
+      replaceRelease.complete(Unit)
+      val replaceRes = withTimeout(5_000) { replaceJob.await() }
+      assertTrue(replaceRes is ReplaceCheckpointExecutionResult.Failed)
+      assertTrue((replaceRes as ReplaceCheckpointExecutionResult.Failed).cause is InvalidRecoveryDraftException)
+      assertFalse(replaceRes.snapshot.hasPendingReplacement)
+      assertEquals(CheckpointPresence.UNKNOWN, replaceRes.snapshot.checkpointPresence)
+
+      val saveRes = withTimeout(5_000) { queuedSave.await() }
+      assertTrue(saveRes is SaveCheckpointExecutionResult.Saved)
+      val saved = saveRes as SaveCheckpointExecutionResult.Saved
+      assertEquals(4L, saved.allocatedRevision)
+      assertEquals(CheckpointPresence.PRESENT, saved.snapshot.checkpointPresence)
+      assertTrue(saved.snapshot.isSyncConfirmationAllowed)
+      assertEquals(1, draftRepo.maxConcurrentCalls.get())
+    }
+
   private class FakeDraftRepository : NoteRecoveryDraftRepository {
     private val store = LinkedHashMap<String, NoteRecoveryDraft>()
     private val concurrentCalls = AtomicInteger(0)

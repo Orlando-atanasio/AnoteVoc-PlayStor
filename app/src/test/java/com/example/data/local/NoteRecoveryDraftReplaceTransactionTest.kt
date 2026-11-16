@@ -905,6 +905,244 @@ class NoteRecoveryDraftReplaceTransactionTest {
       }
     }
 
+  @Test
+  fun `rolls back entire Room transaction when repository throws InvalidRecoveryDraftException after inserting new draft`() =
+    runTest {
+      val note = noteRepository.createNote(title = "Nota origem rollback lógico")
+      val oldSessionId = "old-session-ignore-delete"
+      val oldDraftId = NoteRecoveryDraftKeys.forExistingNote(note.id, oldSessionId)
+      draftRepository.saveCheckpoint(
+        existingNoteInput(
+          draftId = oldDraftId,
+          noteId = note.id,
+          sessionId = oldSessionId,
+          title = "Checkpoint antigo protegido",
+          content =
+            NoteContentDocument(
+              blocks = listOf(ParagraphBlock(id = "p-old", text = "Conteúdo antigo preservado"))
+            ),
+          paperStyle = NotePaperStyle.PONTILHADO,
+          baseRevision = note.revision,
+          baseNoteUpdatedAt = note.updatedAt,
+          checkpointRevision = 6L,
+        )
+      )
+      val oldBefore = database.noteRecoveryDraftDao().getByDraftId(oldDraftId)!!
+
+      // Segundo checkpoint da mesma nota para comprovar isolamento transacional integral.
+      val siblingSessionId = "sibling-session-ignore-delete"
+      val siblingDraftId = NoteRecoveryDraftKeys.forExistingNote(note.id, siblingSessionId)
+      draftRepository.saveCheckpoint(
+        existingNoteInput(
+          draftId = siblingDraftId,
+          noteId = note.id,
+          sessionId = siblingSessionId,
+          title = "Irmão intacto",
+          baseRevision = note.revision,
+          baseNoteUpdatedAt = note.updatedAt,
+          checkpointRevision = 1L,
+        )
+      )
+
+      // Trigger BEFORE DELETE com RAISE(IGNORE): o DELETE executa sem lançar SQLiteException,
+      // mas afeta 0 linhas. Assim, dentro de withTransaction, draftDao.insert(newEntity) conclui
+      // e a própria implementação de NoteRecoveryDraftRepositoryImpl lança InvalidRecoveryDraftException.
+      val writableDb = database.openHelper.writableDatabase
+      writableDb.execSQL(
+        """
+        CREATE TRIGGER ignore_delete_old_draft
+        BEFORE DELETE ON note_recovery_drafts
+        WHEN OLD.draft_id = '$oldDraftId'
+        BEGIN
+          SELECT RAISE(IGNORE);
+        END;
+        """.trimIndent()
+      )
+
+      val newSessionId = "new-session-ignore-delete"
+      val newDraftId = NoteRecoveryDraftKeys.forNewNote(newSessionId)
+      val replacementInput =
+        newNoteInput(
+          draftId = newDraftId,
+          sessionId = newSessionId,
+          title = "Novo checkpoint que deve sofrer rollback",
+          content =
+            NoteContentDocument(
+              blocks = listOf(ParagraphBlock(id = "p-new", text = "Texto novo não commitado"))
+            ),
+          paperStyle = NotePaperStyle.FOREST_MIST,
+          initialPaperStyle = NotePaperStyle.FOREST_MIST,
+          checkpointRevision = 1L,
+        )
+
+      try {
+        draftRepository.replaceCheckpointWithNewNote(
+          oldDraftId = oldDraftId,
+          expectedOldSessionId = oldSessionId,
+          expectedOldTargetNoteId = note.id,
+          newInput = replacementInput,
+        )
+        fail(
+          "Esperava InvalidRecoveryDraftException após deleteByDraftId retornar 0 linhas com RAISE(IGNORE)"
+        )
+      } catch (e: InvalidRecoveryDraftException) {
+        assertTrue(e.message?.contains(oldDraftId) == true)
+
+        // O INSERT já ocorrera antes do DELETE; o rollback do Room deve desfazer o novo registro.
+        assertNull(database.noteRecoveryDraftDao().getByDraftId(newDraftId))
+        assertNull(database.noteRecoveryDraftDao().getBySessionId(newSessionId))
+
+        // O rascunho antigo e o irmão permanecem íntegros e sem coexistência indevida.
+        val oldAfter = database.noteRecoveryDraftDao().getByDraftId(oldDraftId)
+        assertNotNull(oldAfter)
+        assertEquals(oldBefore, oldAfter)
+
+        val siblingAfter = database.noteRecoveryDraftDao().getByDraftId(siblingDraftId)
+        assertNotNull(siblingAfter)
+        assertEquals("Irmão intacto", siblingAfter!!.title)
+
+        assertEquals(2, database.noteRecoveryDraftDao().getAllCheckpoints().size)
+      } finally {
+        writableDb.execSQL("DROP TRIGGER IF EXISTS ignore_delete_old_draft")
+      }
+
+      // Após remoção do trigger, uma nova tentativa idêntica substitui normalmente sem resíduos.
+      val recoveryResult =
+        draftRepository.replaceCheckpointWithNewNote(
+          oldDraftId = oldDraftId,
+          expectedOldSessionId = oldSessionId,
+          expectedOldTargetNoteId = note.id,
+          newInput = replacementInput,
+        )
+      assertTrue(recoveryResult is ReplaceCheckpointWithNewNoteResult.Replaced)
+      assertNull(database.noteRecoveryDraftDao().getByDraftId(oldDraftId))
+      assertNotNull(database.noteRecoveryDraftDao().getByDraftId(newDraftId))
+      assertNotNull(database.noteRecoveryDraftDao().getByDraftId(siblingDraftId))
+      assertEquals(2, database.noteRecoveryDraftDao().getAllCheckpoints().size)
+    }
+
+  @Test
+  fun `rolls back transaction cleanly when SQLite fails during insertion of newEntity`() =
+    runTest {
+      val note = noteRepository.createNote(title = "Nota falha no INSERT")
+      val oldSessionId = "old-session-insert-fail"
+      val oldDraftId = NoteRecoveryDraftKeys.forExistingNote(note.id, oldSessionId)
+      draftRepository.saveCheckpoint(
+        existingNoteInput(
+          draftId = oldDraftId,
+          noteId = note.id,
+          sessionId = oldSessionId,
+          title = "Antigo intacto no INSERT fail",
+          baseRevision = note.revision,
+          baseNoteUpdatedAt = note.updatedAt,
+          checkpointRevision = 3L,
+        )
+      )
+
+      val newSessionId = "new-session-insert-fail"
+      val newDraftId = NoteRecoveryDraftKeys.forNewNote(newSessionId)
+      val writableDb = database.openHelper.writableDatabase
+      writableDb.execSQL(
+        """
+        CREATE TRIGGER fail_insert_new_draft
+        BEFORE INSERT ON note_recovery_drafts
+        WHEN NEW.draft_id = '$newDraftId'
+        BEGIN
+          SELECT RAISE(ABORT, 'Falha SQLite simulada ao inserir novo rascunho');
+        END;
+        """.trimIndent()
+      )
+
+      try {
+        draftRepository.replaceCheckpointWithNewNote(
+          oldDraftId = oldDraftId,
+          expectedOldSessionId = oldSessionId,
+          expectedOldTargetNoteId = note.id,
+          newInput =
+            newNoteInput(
+              draftId = newDraftId,
+              sessionId = newSessionId,
+              title = "Falha no INSERT",
+            ),
+        )
+        fail("Esperava SQLiteException no BEFORE INSERT")
+      } catch (_: SQLiteException) {
+        assertNull(database.noteRecoveryDraftDao().getByDraftId(newDraftId))
+        val intactOld = database.noteRecoveryDraftDao().getByDraftId(oldDraftId)
+        assertNotNull(intactOld)
+        assertEquals("Antigo intacto no INSERT fail", intactOld!!.title)
+        assertEquals(3L, intactOld.checkpointRevision)
+        assertEquals(1, database.noteRecoveryDraftDao().getAllCheckpoints().size)
+      } finally {
+        writableDb.execSQL("DROP TRIGGER IF EXISTS fail_insert_new_draft")
+      }
+    }
+
+  @Test
+  fun `case B idempotency compares normalized content when caller repeats replacement`() = runTest {
+    val note = noteRepository.createNote(title = "Nota normalização")
+    val oldSessionId = "old-norm"
+    val oldDraftId = NoteRecoveryDraftKeys.forExistingNote(note.id, oldSessionId)
+    draftRepository.saveCheckpoint(
+      existingNoteInput(
+        draftId = oldDraftId,
+        noteId = note.id,
+        sessionId = oldSessionId,
+        baseRevision = note.revision,
+        baseNoteUpdatedAt = note.updatedAt,
+      )
+    )
+
+    val newSessionId = "new-norm"
+    val newDraftId = NoteRecoveryDraftKeys.forNewNote(newSessionId)
+    val unnormalizedDoc =
+      NoteContentDocument(
+        blocks =
+          listOf(
+            ParagraphBlock(
+              id = "p1",
+              text = "abc",
+              spans =
+                listOf(
+                  com.example.domain.model.FormatSpan(
+                    start = -5,
+                    end = 10,
+                    style = com.example.domain.model.TextFormatStyle.BOLD,
+                  )
+                ),
+            )
+          )
+      )
+    val firstInput =
+      newNoteInput(
+        draftId = newDraftId,
+        sessionId = newSessionId,
+        title = "Normalizado",
+        content = unnormalizedDoc,
+      )
+
+    val first =
+      draftRepository.replaceCheckpointWithNewNote(
+        oldDraftId = oldDraftId,
+        expectedOldSessionId = oldSessionId,
+        expectedOldTargetNoteId = note.id,
+        newInput = firstInput,
+      )
+    assertTrue(first is ReplaceCheckpointWithNewNoteResult.Replaced)
+
+    val normalizedCopyInput =
+      firstInput.copy(content = NoteContentPolicy.normalizeDocument(unnormalizedDoc))
+    val second =
+      draftRepository.replaceCheckpointWithNewNote(
+        oldDraftId = oldDraftId,
+        expectedOldSessionId = oldSessionId,
+        expectedOldTargetNoteId = note.id,
+        newInput = normalizedCopyInput,
+      )
+    assertTrue(second is ReplaceCheckpointWithNewNoteResult.AlreadyReplaced)
+    assertEquals(1, database.noteRecoveryDraftDao().getAllCheckpoints().size)
+  }
+
   private fun newNoteInput(
     draftId: String,
     sessionId: String,
