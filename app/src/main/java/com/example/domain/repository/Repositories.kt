@@ -1,5 +1,6 @@
 package com.example.domain.repository
 
+import com.example.domain.editor.FolderAvailability
 import com.example.domain.model.AppPreferences
 import com.example.domain.model.AppThemeMode
 import com.example.domain.model.Folder
@@ -10,6 +11,7 @@ import com.example.domain.model.NoteContentState
 import com.example.domain.model.NotePaperStyle
 import com.example.domain.model.NoteRecoveryDraft
 import com.example.domain.model.NoteRecoveryDraftInput
+import com.example.domain.model.ReplaceCheckpointWithNewNoteResult
 import com.example.domain.model.SaveCheckpointResult
 import kotlinx.coroutines.flow.Flow
 
@@ -71,6 +73,7 @@ interface FolderRepository {
   fun observeActiveFolders(): Flow<List<Folder>>
   fun observeDeletedFolders(): Flow<List<Folder>>
   suspend fun getFolderById(folderId: Long): Folder?
+  suspend fun getFoldersByIds(ids: Set<Long>): Map<Long, FolderAvailability>
   suspend fun createFolder(name: String): Folder
   suspend fun renameFolder(folderId: Long, newName: String): Folder
   suspend fun deleteFolder(folderId: Long, mode: FolderDeleteMode)
@@ -114,8 +117,15 @@ interface NoteRecoveryDraftRepository {
   fun observeAllCheckpoints(): Flow<List<NoteRecoveryDraft>>
   suspend fun getAllCheckpoints(): List<NoteRecoveryDraft>
   suspend fun getCheckpointById(draftId: String): NoteRecoveryDraft?
+  suspend fun getCheckpointBySessionId(sessionId: String): NoteRecoveryDraft?
   suspend fun getCheckpointsForNote(noteId: Long): List<NoteRecoveryDraft>
   suspend fun saveCheckpoint(input: NoteRecoveryDraftInput): SaveCheckpointResult
+  suspend fun replaceCheckpointWithNewNote(
+    oldDraftId: String,
+    expectedOldSessionId: String,
+    expectedOldTargetNoteId: Long,
+    newInput: NoteRecoveryDraftInput,
+  ): ReplaceCheckpointWithNewNoteResult
   suspend fun deleteCheckpoint(draftId: String)
   suspend fun deleteCheckpointsForNote(noteId: Long)
 }

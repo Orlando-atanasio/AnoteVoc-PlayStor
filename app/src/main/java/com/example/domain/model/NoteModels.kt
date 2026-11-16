@@ -202,3 +202,13 @@ sealed interface SaveCheckpointResult {
     val attemptedCheckpointRevision: Long,
   ) : SaveCheckpointResult
 }
+
+sealed interface ReplaceCheckpointWithNewNoteResult {
+  data class Replaced(
+    val draft: NoteRecoveryDraft
+  ) : ReplaceCheckpointWithNewNoteResult
+
+  data class AlreadyReplaced(
+    val draft: NoteRecoveryDraft
+  ) : ReplaceCheckpointWithNewNoteResult
+}

@@ -18,6 +18,9 @@ interface FolderDao {
   @Query("SELECT * FROM folders WHERE id = :folderId LIMIT 1")
   suspend fun getById(folderId: Long): FolderEntity?
 
+  @Query("SELECT * FROM folders WHERE id IN (:folderIds)")
+  suspend fun getByIds(folderIds: List<Long>): List<FolderEntity>
+
   @Query("SELECT * FROM folders WHERE active_name_key = :normalizedKey LIMIT 1")
   suspend fun findActiveByNormalizedKey(normalizedKey: String): FolderEntity?
 

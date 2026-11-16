@@ -9,6 +9,7 @@ import com.example.data.local.dao.NoteDao
 import com.example.data.local.database.AnoteVoceDatabase
 import com.example.data.local.entity.FolderEntity
 import com.example.data.local.mapper.toDomain
+import com.example.domain.editor.FolderAvailability
 import com.example.domain.model.Folder
 import com.example.domain.policy.FolderNameNormalizer
 import com.example.domain.repository.DuplicateFolderNameException
@@ -20,6 +21,7 @@ import com.example.domain.repository.FolderRepository
 import com.example.domain.repository.InvalidFolderNameException
 import com.example.domain.repository.RestoreFolderResult
 import java.util.UUID
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.flow.map
@@ -47,6 +49,42 @@ class FolderRepositoryImpl(
 
   override suspend fun getFolderById(folderId: Long): Folder? =
     withContext(dispatchers.io) { folderDao.getById(folderId)?.toDomain() }
+
+  override suspend fun getFoldersByIds(ids: Set<Long>): Map<Long, FolderAvailability> {
+    if (ids.isEmpty()) return emptyMap()
+    for (id in ids) {
+      require(id > 0L) { "Identificador de pasta inválido para consulta em lote: $id" }
+    }
+
+    return withContext(dispatchers.io) {
+      try {
+        val foundById = HashMap<Long, FolderEntity>(ids.size)
+        for (batch in ids.toList().chunked(BATCH_LOOKUP_CHUNK_SIZE)) {
+          val entities = folderDao.getByIds(batch)
+          for (entity in entities) {
+            foundById[entity.id] = entity
+          }
+        }
+        buildMap(ids.size) {
+          for (id in ids) {
+            val entity = foundById[id]
+            val availability =
+              when {
+                entity == null -> FolderAvailability.NotFound(id)
+                entity.isDeleted -> FolderAvailability.InTrash(entity.toDomain())
+                else -> FolderAvailability.Active(entity.toDomain())
+              }
+            put(id, availability)
+          }
+        }
+      } catch (e: CancellationException) {
+        throw e
+      } catch (e: Exception) {
+        val reason = e.message?.takeIf { it.isNotBlank() } ?: e::class.simpleName
+        ids.associateWith { id -> FolderAvailability.Unknown(folderId = id, reason = reason) }
+      }
+    }
+  }
 
   override suspend fun createFolder(name: String): Folder =
     withContext(dispatchers.io) {
@@ -208,5 +246,9 @@ class FolderRepositoryImpl(
         folderDao.deleteById(folderId)
       }
     }
+  }
+
+  private companion object {
+    const val BATCH_LOOKUP_CHUNK_SIZE: Int = 500
   }
 }
