@@ -31,6 +31,7 @@ import com.example.domain.repository.FolderRepository
 import com.example.domain.repository.NoteConflictException
 import com.example.domain.repository.NoteRecoveryDraftRepository
 import com.example.domain.repository.NoteRepository
+import com.example.domain.repository.PinNoteResult
 import com.example.domain.repository.PreferencesRepository
 import com.example.domain.repository.RestoreFolderResult
 import java.io.IOException
@@ -1578,6 +1579,56 @@ class NoteEditorSessionCoordinatorTest {
       assertTrue(h.registry.snapshot().reservedDraftIds.isEmpty())
     }
 
+  @Test
+  fun persistExistingNotePin_whenNoteModifiedConcurrentlyBeforePinCommit_opensConflictAndKeepsOriginalBaselineRevision() =
+    runTest {
+      val h = CoordinatorHarness(this)
+      val existing =
+        h.noteRepo.seedNote(
+          id = 210L,
+          title = "Original",
+          revision = 1L,
+          isPinned = false,
+          text = "Base",
+        )
+      val coord =
+        h.createCoordinator(
+          openRequest = NoteEditorOpenRequest.OpenExisting(existing.id),
+          parentScope = backgroundScope,
+        )
+      coord.start()
+      testScheduler.runCurrent()
+      coord.awaitInitialized()
+
+      submitMutation(
+        coord,
+        SessionCommand.ApplyTextChange("p-${existing.id}", "Edição em memória", 17, 17),
+      )
+
+      // Simula escrita concorrente disparada durante a janela da operação condicional de pin.
+      h.noteRepo.onBeforeConditionalPinHook = { id ->
+        val current = h.noteRepo.notes[id]!!
+        h.noteRepo.notes[id] =
+          current.copy(
+            title = "Modificada concorrentemente",
+            revision = current.revision + 1L,
+            updatedAt = current.updatedAt + 500L,
+          )
+      }
+
+      val outcome = submitAndAwait(coord) { SessionCommand.PersistExistingNotePin(isPinned = true, ackDeferred = it) }
+
+      assertTrue(outcome is SessionCommandOutcome.Failed)
+      val state = coord.uiState.value
+      assertNotNull(state.activeConflict)
+      assertEquals(1L, (state.baseline as NoteEditorBaseline.ExistingNote).baseRevision)
+      assertFalse(h.noteRepo.notes[existing.id]!!.isPinned)
+      assertEquals(2L, h.noteRepo.notes[existing.id]!!.revision)
+      assertFalse(state.isPinned)
+      assertEquals("Edição em memória", state.editorState.document.blocks.first().text)
+      coord.closeAndAbort()
+    }
+
   private class TestPreferencesRepository : PreferencesRepository {
     var current = AppPreferences()
 
@@ -1649,6 +1700,7 @@ class NoteEditorSessionCoordinatorTest {
     val createCalls = AtomicInteger(0)
     val updateCalls = AtomicInteger(0)
     var onGetNoteHook: (suspend (Long) -> Unit)? = null
+    var onBeforeConditionalPinHook: (suspend (Long) -> Unit)? = null
 
     fun seedNote(
       id: Long,
@@ -1767,6 +1819,30 @@ class NoteEditorSessionCoordinatorTest {
     override suspend fun updateNotePaperStyle(noteId: Long, paperStyle: NotePaperStyle): Note = error("unused")
 
     override suspend fun setNotePinned(noteId: Long, pinned: Boolean) = error("unused")
+
+    override suspend fun setNotePinnedIfRevision(
+      noteId: Long,
+      pinned: Boolean,
+      expectedBaseRevision: Long,
+    ): PinNoteResult {
+      onBeforeConditionalPinHook?.invoke(noteId)
+      val existing = notes[noteId] ?: throw NoSuchElementException("Note $noteId not found")
+      if (existing.revision != expectedBaseRevision) {
+        return PinNoteResult.Conflict(expectedBaseRevision, existing)
+      }
+      if (existing.isPinned == pinned) {
+        return PinNoteResult.Unchanged(existing)
+      }
+      val updated =
+        existing.copy(
+          isPinned = pinned,
+          pinnedAt = if (pinned) clock.nowMillis() else null,
+          revision = existing.revision + 1L,
+          updatedAt = clock.nowMillis(),
+        )
+      notes[noteId] = updated
+      return PinNoteResult.Updated(updated)
+    }
 
     override suspend fun moveNoteToFolder(noteId: Long, folderId: Long?) = error("unused")
 

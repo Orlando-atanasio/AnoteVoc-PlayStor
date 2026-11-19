@@ -23,8 +23,12 @@ import com.example.domain.model.SaveCheckpointResult
 import com.example.domain.policy.NoteContentPolicy
 import com.example.domain.repository.FolderDeleteMode
 import com.example.domain.repository.FolderRepository
+import com.example.domain.repository.NoteConflictException
+import com.example.domain.repository.NoteDeletedException
+import com.example.domain.repository.NoteNotFoundException
 import com.example.domain.repository.NoteRecoveryDraftRepository
 import com.example.domain.repository.NoteRepository
+import com.example.domain.repository.PinNoteResult
 import com.example.domain.repository.RestoreFolderResult
 import java.io.IOException
 import java.util.concurrent.atomic.AtomicLong
@@ -1010,6 +1014,111 @@ class SessionStructuralRunnerTest {
       assertTrue(divergent is ReplacementReconciliationResult.DivergentAnomaly)
     }
 
+  @Test
+  fun persistExistingNotePin_whenConcurrentWriteAdvancesRevision_returnsConflictAndDoesNotPin() =
+    runTest {
+      val h = RunnerHarness()
+      val note = h.noteRepo.seedNote(id = 201L, title = "Nota 201", revision = 1L, isPinned = false)
+      val identity = h.createIdentity(note.id, sessionId = "pin-race")
+      val runtime =
+        h.createRuntimeSnapshot(
+          identity = identity,
+          baseline =
+            NoteEditorBaseline.ExistingNote(
+              noteId = note.id,
+              baseRevision = 1L,
+              baseNoteUpdatedAt = note.updatedAt,
+              title = note.title,
+              normalizedContent = NoteEditorSessionEvaluator.canonicalizeDocument(NoteContentDocument.empty()),
+              paperStyle = NotePaperStyle.LINHAS,
+              staticFolderId = null,
+              currentDbIsPinned = false,
+            ),
+          snapshot =
+            NoteEditorEditableSnapshot(
+              title = note.title,
+              document = NoteContentDocument.empty(),
+              effectiveFolderId = null,
+              fallbackSourceFolderId = null,
+              paperStyle = NotePaperStyle.LINHAS,
+              isPinned = false,
+            ),
+          folderContext = ResolvedDraftFolderContext(effectiveTarget = FolderAvailability.Root),
+          conflict = null,
+        )
+
+      // Simula uma escrita concorrente que avança revision exatamente antes da atualização condicional.
+      h.noteRepo.onBeforeConditionalPin = { noteId ->
+        val latest = h.noteRepo.notes[noteId]!!
+        h.noteRepo.notes[noteId] =
+          latest.copy(
+            title = "Alterada concorrentemente",
+            revision = latest.revision + 1L,
+            updatedAt = latest.updatedAt + 500L,
+          )
+      }
+
+      val result =
+        h.runner.runPersistExistingNotePin(
+          command = SessionCommand.PersistExistingNotePin(isPinned = true),
+          runtimeSnapshot = runtime,
+        )
+
+      assertTrue(result is StructuralRunnerResult.Failed)
+      val failed = result as StructuralRunnerResult.Failed
+      assertTrue(failed.cause is NoteConflictException)
+      val conflictData = failed.fallbackData as StructuralOutcomeData.ConsolidationConflictDetected
+      assertEquals(1L, (conflictData.conflict as RecoveryConflict.NoteDiverged).draftBaseRevision)
+      assertEquals(2L, conflictData.conflict.currentNoteRevision)
+      assertFalse(h.noteRepo.notes[note.id]!!.isPinned)
+      assertEquals(2L, h.noteRepo.notes[note.id]!!.revision)
+    }
+
+  @Test
+  fun persistExistingNotePin_whenRevisionMatches_updatesPinAndBumpsRevisionAtomically() =
+    runTest {
+      val h = RunnerHarness()
+      val note = h.noteRepo.seedNote(id = 202L, title = "Nota 202", revision = 3L, isPinned = false)
+      val identity = h.createIdentity(note.id, sessionId = "pin-ok")
+      val runtime =
+        h.createRuntimeSnapshot(
+          identity = identity,
+          baseline =
+            NoteEditorBaseline.ExistingNote(
+              noteId = note.id,
+              baseRevision = 3L,
+              baseNoteUpdatedAt = note.updatedAt,
+              title = note.title,
+              normalizedContent = NoteEditorSessionEvaluator.canonicalizeDocument(NoteContentDocument.empty()),
+              paperStyle = NotePaperStyle.LINHAS,
+              staticFolderId = null,
+              currentDbIsPinned = false,
+            ),
+          snapshot =
+            NoteEditorEditableSnapshot(
+              title = note.title,
+              document = NoteContentDocument.empty(),
+              effectiveFolderId = null,
+              fallbackSourceFolderId = null,
+              paperStyle = NotePaperStyle.LINHAS,
+              isPinned = false,
+            ),
+          folderContext = ResolvedDraftFolderContext(effectiveTarget = FolderAvailability.Root),
+          conflict = null,
+        )
+
+      val result =
+        h.runner.runPersistExistingNotePin(
+          command = SessionCommand.PersistExistingNotePin(isPinned = true),
+          runtimeSnapshot = runtime,
+        )
+
+      assertTrue(result is StructuralRunnerResult.Succeeded)
+      val updated = ((result as StructuralRunnerResult.Succeeded).data as StructuralOutcomeData.ExistingNotePinUpdated).updatedNote
+      assertTrue(updated.isPinned)
+      assertEquals(4L, updated.revision)
+    }
+
   private class FakeFolderRepository : FolderRepository {
     val folders = linkedMapOf<Long, Folder>()
     val requestedIds = mutableListOf<Set<Long>>()
@@ -1057,6 +1166,7 @@ class SessionStructuralRunnerTest {
 
   private class FakeNoteRepository : NoteRepository {
     val notes = linkedMapOf<Long, Note>()
+    var onBeforeConditionalPin: (suspend (Long) -> Unit)? = null
 
     fun seedNote(
       id: Long,
@@ -1120,6 +1230,31 @@ class SessionStructuralRunnerTest {
     override suspend fun updateNotePaperStyle(noteId: Long, paperStyle: NotePaperStyle): Note = error("unused")
 
     override suspend fun setNotePinned(noteId: Long, pinned: Boolean) = error("unused")
+
+    override suspend fun setNotePinnedIfRevision(
+      noteId: Long,
+      pinned: Boolean,
+      expectedBaseRevision: Long,
+    ): PinNoteResult {
+      onBeforeConditionalPin?.invoke(noteId)
+      val current = notes[noteId] ?: throw NoteNotFoundException(noteId)
+      if (current.isDeleted) throw NoteDeletedException(noteId)
+      if (current.revision != expectedBaseRevision) {
+        return PinNoteResult.Conflict(expectedBaseRevision, current)
+      }
+      if (current.isPinned == pinned) {
+        return PinNoteResult.Unchanged(current)
+      }
+      val updated =
+        current.copy(
+          isPinned = pinned,
+          pinnedAt = if (pinned) 9_999L else null,
+          revision = current.revision + 1L,
+          updatedAt = current.updatedAt + 1L,
+        )
+      notes[noteId] = updated
+      return PinNoteResult.Updated(updated)
+    }
 
     override suspend fun moveNoteToFolder(noteId: Long, folderId: Long?) = error("unused")
 

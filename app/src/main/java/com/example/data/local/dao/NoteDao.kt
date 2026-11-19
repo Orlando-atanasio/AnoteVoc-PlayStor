@@ -114,6 +114,24 @@ interface NoteDao {
   @Query(
     """
     UPDATE notes
+    SET is_pinned = :isPinned,
+        pinned_at = :pinnedAt,
+        revision = revision + 1,
+        updated_at = :updatedAt
+    WHERE id = :noteId AND is_deleted = 0 AND revision = :expectedRevision
+    """
+  )
+  suspend fun updatePinnedIfRevision(
+    noteId: Long,
+    isPinned: Boolean,
+    pinnedAt: Long?,
+    updatedAt: Long,
+    expectedRevision: Long,
+  ): Int
+
+  @Query(
+    """
+    UPDATE notes
     SET folder_id = :folderId,
         revision = revision + 1,
         updated_at = :updatedAt

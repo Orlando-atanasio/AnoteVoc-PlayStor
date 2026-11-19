@@ -12,8 +12,10 @@ import com.example.domain.model.NoteContentState
 import com.example.domain.model.NoteRecoveryDraftKeys
 import com.example.domain.repository.FolderRepository
 import com.example.domain.repository.InvalidRecoveryDraftException
+import com.example.domain.repository.NoteConflictException
 import com.example.domain.repository.NoteRecoveryDraftRepository
 import com.example.domain.repository.NoteRepository
+import com.example.domain.repository.PinNoteResult
 
 internal sealed interface StructuralRunnerResult {
   data class Succeeded(val data: StructuralOutcomeData) : StructuralRunnerResult
@@ -701,4 +703,81 @@ internal class SessionStructuralRunner(
       }
       is DeleteCheckpointExecutionResult.Failed -> StructuralRunnerResult.Failed(delRes.cause)
     }
+
+  suspend fun runPersistExistingNotePin(
+    command: SessionCommand.PersistExistingNotePin,
+    runtimeSnapshot: SessionRuntimeState,
+  ): StructuralRunnerResult {
+    val targetNoteId =
+      runtimeSnapshot.identity.targetNoteId
+        ?: return StructuralRunnerResult.Failed(
+          IllegalStateException("PersistExistingNotePin exige uma nota existente.")
+        )
+    val baseline =
+      runtimeSnapshot.baseline as? NoteEditorBaseline.ExistingNote
+        ?: return StructuralRunnerResult.Failed(
+          IllegalStateException("Baseline inválida para fixar nota existente.")
+        )
+
+    return try {
+      val conflictForLatest: (com.example.domain.model.Note) -> StructuralRunnerResult.Failed =
+        { latest ->
+          val conflict =
+            RecoveryConflict.NoteDiverged(
+              draftId = runtimeSnapshot.identity.draftId,
+              targetNoteId = targetNoteId,
+              draftBaseRevision = baseline.baseRevision,
+              currentNoteRevision = latest.revision,
+              draftBaseUpdatedAt = baseline.baseNoteUpdatedAt,
+              currentNoteUpdatedAt = latest.updatedAt,
+            )
+          StructuralRunnerResult.Failed(
+            cause =
+              NoteConflictException(
+                noteId = targetNoteId,
+                expectedRevision = baseline.baseRevision,
+                actualRevision = latest.revision,
+              ),
+            fallbackData =
+              StructuralOutcomeData.ConsolidationConflictDetected(
+                conflict = conflict,
+                latestNote = latest,
+              ),
+          )
+        }
+
+      when (
+        val pinRes =
+          noteRepository.setNotePinnedIfRevision(
+            noteId = targetNoteId,
+            pinned = command.isPinned,
+            expectedBaseRevision = baseline.baseRevision,
+          )
+      ) {
+        is PinNoteResult.Updated -> {
+          if (pinRes.note.revision != baseline.baseRevision + 1L) {
+            conflictForLatest(pinRes.note)
+          } else {
+            StructuralRunnerResult.Succeeded(
+              StructuralOutcomeData.ExistingNotePinUpdated(pinRes.note)
+            )
+          }
+        }
+        is PinNoteResult.Unchanged -> {
+          if (pinRes.note.revision != baseline.baseRevision) {
+            conflictForLatest(pinRes.note)
+          } else {
+            StructuralRunnerResult.Succeeded(
+              StructuralOutcomeData.ExistingNotePinUpdated(pinRes.note)
+            )
+          }
+        }
+        is PinNoteResult.Conflict -> conflictForLatest(pinRes.latestNote)
+      }
+    } catch (c: kotlinx.coroutines.CancellationException) {
+      throw c
+    } catch (t: Throwable) {
+      StructuralRunnerResult.Failed(t)
+    }
+  }
 }

@@ -199,10 +199,13 @@ private fun DrawerBrandHeader(
         modifier = Modifier.weight(1f),
       ) {
         Image(
-          painter = painterResource(id = R.drawable.anotevoce_icon_1794692611885),
+          painter = painterResource(id = R.drawable.ic_brand_anotevoce_emblem),
           contentDescription = stringResource(R.string.cd_app_emblem),
-          contentScale = ContentScale.Crop,
-          modifier = Modifier.size(36.dp).clip(MaterialTheme.shapes.small),
+          contentScale = ContentScale.Fit,
+          modifier =
+            Modifier.size(40.dp)
+              .clip(MaterialTheme.shapes.small)
+              .testTag("drawer_brand_emblem"),
         )
         Column {
           Text(

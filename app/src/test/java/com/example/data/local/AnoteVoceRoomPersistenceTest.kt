@@ -680,6 +680,49 @@ class AnoteVoceRoomPersistenceTest {
     assertTrue(updated.updatedAt > 0L)
   }
 
+  @Test
+  fun `setNotePinnedIfRevision detects stale revision and updates only when revision matches`() =
+    runTest {
+      val initial =
+        noteRepository.createNote(
+          title = "Nota fixa",
+          content = NoteContentDocument(blocks = listOf(ParagraphBlock(id = "b1", text = "Texto"))),
+          isPinned = false,
+        )
+
+      val concurrent =
+        noteRepository.updateNote(
+          noteId = initial.id,
+          title = "Alterada concorrentemente",
+          content = NoteContentDocument(blocks = listOf(ParagraphBlock(id = "b1", text = "Novo texto"))),
+          folderId = null,
+          expectedBaseRevision = initial.revision,
+        )
+
+      val conflictRes =
+        noteRepository.setNotePinnedIfRevision(
+          noteId = initial.id,
+          pinned = true,
+          expectedBaseRevision = initial.revision,
+        )
+      assertTrue(conflictRes is com.example.domain.repository.PinNoteResult.Conflict)
+      val conflict = conflictRes as com.example.domain.repository.PinNoteResult.Conflict
+      assertEquals(initial.revision, conflict.expectedRevision)
+      assertEquals(concurrent.revision, conflict.latestNote.revision)
+      assertFalse(noteRepository.getNoteById(initial.id)!!.isPinned)
+
+      val okRes =
+        noteRepository.setNotePinnedIfRevision(
+          noteId = initial.id,
+          pinned = true,
+          expectedBaseRevision = concurrent.revision,
+        )
+      assertTrue(okRes is com.example.domain.repository.PinNoteResult.Updated)
+      val updated = (okRes as com.example.domain.repository.PinNoteResult.Updated).note
+      assertTrue(updated.isPinned)
+      assertEquals(concurrent.revision + 1L, updated.revision)
+    }
+
   private fun assertNotEquals(a: Long, b: Long) {
     org.junit.Assert.assertNotEquals(a, b)
   }

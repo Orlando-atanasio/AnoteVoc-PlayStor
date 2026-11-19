@@ -153,6 +153,7 @@ sealed interface SessionCommand {
     val blockId: String,
     val start: Int,
     val end: Int = start,
+    override val ackDeferred: CompletableDeferred<SessionCommandOutcome>? = null,
   ) : SessionCommand {
     init {
       require(blockId.isNotBlank()) { "blockId não pode ficar em branco." }
@@ -223,6 +224,13 @@ sealed interface SessionCommand {
   }
 
   data class CloseSession(
+    override val ackDeferred: CompletableDeferred<SessionCommandOutcome>? = null,
+  ) : SessionCommand {
+    override val isPersistableMutation: Boolean = false
+  }
+
+  data class PersistExistingNotePin(
+    val isPinned: Boolean,
     override val ackDeferred: CompletableDeferred<SessionCommandOutcome>? = null,
   ) : SessionCommand {
     override val isPersistableMutation: Boolean = false
@@ -332,6 +340,7 @@ enum class BarrierReason {
   CONSOLIDATION,
   CONFLICT_RESOLUTION,
   DISCARD_DRAFT,
+  PIN_UPDATE,
 }
 
 /**

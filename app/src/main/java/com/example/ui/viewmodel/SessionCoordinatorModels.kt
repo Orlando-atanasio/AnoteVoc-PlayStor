@@ -206,6 +206,10 @@ internal sealed interface StructuralOutcomeData {
     val resolvedFolderAvailability: Map<Long, FolderAvailability> = emptyMap(),
   ) : StructuralOutcomeData
 
+  data class ExistingNotePinUpdated(
+    val updatedNote: Note,
+  ) : StructuralOutcomeData
+
   data object DiscardedAndClosed : StructuralOutcomeData
 }
 
@@ -353,7 +357,8 @@ internal object SessionMutationApplier {
       is SessionCommand.ResolveConflict,
       is SessionCommand.ConsolidateNote,
       is SessionCommand.DiscardDraftAndClose,
-      is SessionCommand.CloseSession -> Unit
+      is SessionCommand.CloseSession,
+      is SessionCommand.PersistExistingNotePin -> Unit
     }
 
     val snapshotChanged =

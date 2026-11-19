@@ -26,6 +26,7 @@ import com.example.domain.repository.NoteDeletedException
 import com.example.domain.repository.NoteNotDeletedException
 import com.example.domain.repository.NoteNotFoundException
 import com.example.domain.repository.NoteRepository
+import com.example.domain.repository.PinNoteResult
 import com.example.domain.repository.UnreadableNoteContentException
 import java.util.UUID
 import kotlinx.coroutines.flow.Flow
@@ -237,6 +238,55 @@ class NoteRepositoryImpl(
       }
     }
   }
+
+  override suspend fun setNotePinnedIfRevision(
+    noteId: Long,
+    pinned: Boolean,
+    expectedBaseRevision: Long,
+  ): PinNoteResult =
+    withContext(dispatchers.io) {
+      database.withTransaction {
+        val current = noteDao.getById(noteId) ?: throw NoteNotFoundException(noteId)
+        if (current.isDeleted) throw NoteDeletedException(noteId)
+        if (current.revision != expectedBaseRevision) {
+          return@withTransaction PinNoteResult.Conflict(
+            expectedRevision = expectedBaseRevision,
+            latestNote = current.toDomain(),
+          )
+        }
+        if (current.isPinned == pinned) {
+          return@withTransaction PinNoteResult.Unchanged(current.toDomain())
+        }
+
+        val now = clock.nowMillis()
+        val pinnedAt = if (pinned) now else null
+        val affected =
+          noteDao.updatePinnedIfRevision(
+            noteId = noteId,
+            isPinned = pinned,
+            pinnedAt = pinnedAt,
+            updatedAt = now,
+            expectedRevision = expectedBaseRevision,
+          )
+        if (affected != 1) {
+          val latest = noteDao.getById(noteId) ?: throw NoteNotFoundException(noteId)
+          if (latest.isDeleted) throw NoteDeletedException(noteId)
+          return@withTransaction PinNoteResult.Conflict(
+            expectedRevision = expectedBaseRevision,
+            latestNote = latest.toDomain(),
+          )
+        }
+
+        val updated = noteDao.getById(noteId)?.toDomain() ?: throw NoteNotFoundException(noteId)
+        if (updated.revision != expectedBaseRevision + 1L) {
+          return@withTransaction PinNoteResult.Conflict(
+            expectedRevision = expectedBaseRevision,
+            latestNote = updated,
+          )
+        }
+        PinNoteResult.Updated(updated)
+      }
+    }
 
   override suspend fun moveNoteToFolder(noteId: Long, folderId: Long?) {
     withContext(dispatchers.io) {

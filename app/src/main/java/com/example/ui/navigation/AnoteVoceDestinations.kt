@@ -16,3 +16,11 @@ sealed interface AnoteVoceDestination {
 
   @Serializable data class Folder(val folderId: Long) : AnoteVoceDestination
 }
+
+@Serializable
+data class NoteEditorRoute(
+  val noteId: Long? = null,
+  val initialFolderId: Long? = null,
+  val initialPinned: Boolean = false,
+  val recoveryDraftId: String? = null,
+)

@@ -21,6 +21,7 @@ import com.example.domain.model.SaveCheckpointResult
 import com.example.domain.policy.NoteContentPolicy
 import com.example.domain.repository.NoteRecoveryDraftRepository
 import com.example.domain.repository.NoteRepository
+import com.example.domain.repository.PinNoteResult
 import java.io.IOException
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
@@ -503,6 +504,12 @@ class SessionShutdownCoordinatorTest {
     override suspend fun updateNotePaperStyle(noteId: Long, paperStyle: NotePaperStyle): Note = error("unused")
 
     override suspend fun setNotePinned(noteId: Long, pinned: Boolean) = error("unused")
+
+    override suspend fun setNotePinnedIfRevision(
+      noteId: Long,
+      pinned: Boolean,
+      expectedBaseRevision: Long,
+    ): PinNoteResult = error("unused")
 
     override suspend fun moveNoteToFolder(noteId: Long, folderId: Long?) = error("unused")
 

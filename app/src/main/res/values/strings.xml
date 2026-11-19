@@ -39,4 +39,73 @@
     <string name="state_selected">Selecionado</string>
     <string name="state_not_selected">Não selecionado</string>
     <string name="loading_notes">Carregando anotações…</string>
+
+    <!-- Etapa 1: Criação, recuperação na Home e Editor de Notas -->
+    <string name="cd_create_note">Nova nota</string>
+    <string name="home_trash_read_only_message">Notas em Apagados não podem ser editadas neste estágio.</string>
+    <string name="home_pending_recovery_title">Edição não finalizada encontrada</string>
+    <string name="home_pending_recovery_subtitle_single">Há um rascunho salvo automaticamente pronto para continuar.</string>
+    <string name="home_pending_recovery_resume">Continuar edição</string>
+    <string name="home_pending_recovery_discard">Descartar</string>
+
+    <string name="cd_editor_back">Voltar</string>
+    <string name="cd_editor_undo">Desfazer</string>
+    <string name="cd_editor_redo">Refazer</string>
+    <string name="cd_editor_paper">Papel da nota</string>
+    <string name="cd_editor_more">Mais opções</string>
+    <string name="cd_editor_checklist_toggle">Alternar item da lista: %1$s</string>
+    <string name="cd_editor_save_in_selector">Selecionar pasta de destino</string>
+
+    <string name="editor_title_placeholder">Título (opcional)</string>
+    <string name="editor_content_placeholder">Comece a escrever sua anotação…</string>
+    <string name="editor_reading_mode_hint">Toque no conteúdo para editar</string>
+    <string name="editor_recovered_draft_badge">Rascunho recuperado</string>
+    <string name="editor_save_in_prefix">Salvar em:</string>
+    <string name="editor_save_in_root">Todas no meu phone</string>
+    <string name="editor_folder_label_prefix">Pasta:</string>
+    <string name="editor_folder_unavailable">Pasta indisponível</string>
+    <string name="editor_folder_picker_title">Salvar nota em</string>
+    <string name="editor_paper_picker_title">Estilo de papel</string>
+
+    <string name="editor_menu_share">Compartilhar</string>
+    <string name="editor_menu_delete">Excluir</string>
+    <string name="editor_menu_pin">Fixar</string>
+    <string name="editor_menu_unpin">Desafixar</string>
+    <string name="editor_share_chooser_title">Compartilhar nota</string>
+    <string name="editor_share_unavailable">Nenhum aplicativo disponível para compartilhar esta nota.</string>
+
+    <string name="editor_delete_confirm_title">Enviar nota para Apagados?</string>
+    <string name="editor_delete_confirm_message">Você poderá recuperar esta nota em Apagados depois.</string>
+    <string name="editor_delete_empty_confirm_message">Esta nota vazia será descartada sem criar registro em Apagados.</string>
+    <string name="editor_delete_confirm_action">Excluir</string>
+    <string name="action_cancel">Cancelar</string>
+    <string name="action_close">Fechar</string>
+    <string name="action_save_in_all_notes">Salvar em Todas no meu phone</string>
+    <string name="action_choose_folder">Escolher pasta</string>
+
+    <string name="editor_fallback_banner_message">A pasta selecionada ficou indisponível. Escolha outra pasta ou salve em Todas no meu phone.</string>
+    <string name="editor_fallback_confirm_title">Pasta de destino indisponível</string>
+    <string name="editor_fallback_confirm_message">A pasta original desta nota não está disponível no momento. Deseja salvar em Todas no meu phone?</string>
+
+    <string name="editor_conflict_title">Conflito de recuperação detectado</string>
+    <string name="editor_conflict_message">Esta nota foi modificada desde que o rascunho foi salvo. Como deseja continuar?</string>
+    <string name="editor_conflict_keep_draft">Manter este rascunho sobre a nota atual</string>
+    <string name="editor_conflict_discard_draft">Descartar rascunho e usar a nota atual</string>
+    <string name="editor_conflict_save_as_new">Salvar rascunho como nova nota</string>
+
+    <string name="editor_blocked_title">Não foi possível abrir para edição</string>
+    <string name="editor_error_title">Ocorreu um problema na sessão</string>
+    <string name="editor_loading_message">Preparando anotação…</string>
+
+    <string name="cd_format_bold">Negrito</string>
+    <string name="cd_format_italic">Itálico</string>
+    <string name="cd_format_underline">Sublinhado</string>
+    <string name="cd_format_bullet_list">Lista com marcadores</string>
+    <string name="cd_format_numbered_list">Lista numerada</string>
+    <string name="cd_format_checklist">Checklist</string>
+    <string name="editor_format_toolbar_label">Ferramentas de formatação</string>
+
+    <string name="autosave_saving">Salvando…</string>
+    <string name="autosave_saved">Salvo no rascunho</string>
+    <string name="autosave_error">Erro ao salvar automaticamente</string>
 </resources>

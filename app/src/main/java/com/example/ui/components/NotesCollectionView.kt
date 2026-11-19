@@ -54,6 +54,7 @@ fun NotesCollectionView(
   folderNamesById: Map<Long, String>,
   showFolderBadge: Boolean,
   modifier: Modifier = Modifier,
+  onNoteClick: (Note) -> Unit = {},
   headerContent: (@Composable () -> Unit)? = null,
 ) {
   when (viewMode) {
@@ -77,6 +78,7 @@ fun NotesCollectionView(
             folderName = if (showFolderBadge) note.folderId?.let { folderNamesById[it] } else null,
             compact = false,
             maxPreviewLines = 4,
+            onClick = { onNoteClick(note) },
             modifier = Modifier.fillMaxWidth().widthIn(max = 760.dp),
           )
         }
@@ -102,6 +104,7 @@ fun NotesCollectionView(
             folderName = if (showFolderBadge) note.folderId?.let { folderNamesById[it] } else null,
             compact = false,
             maxPreviewLines = 5,
+            onClick = { onNoteClick(note) },
             modifier = Modifier.fillMaxWidth(),
           )
         }
@@ -128,6 +131,7 @@ fun NotesCollectionView(
             folderName = if (showFolderBadge) note.folderId?.let { folderNamesById[it] } else null,
             compact = true,
             maxPreviewLines = 1,
+            onClick = { onNoteClick(note) },
             modifier = Modifier.fillMaxWidth().widthIn(max = 760.dp),
           )
         }
@@ -143,12 +147,36 @@ private fun NotePreviewCard(
   folderName: String?,
   compact: Boolean,
   maxPreviewLines: Int,
+  onClick: () -> Unit,
   modifier: Modifier = Modifier,
 ) {
   val surfaceTokens = LocalAnoteVoceSurfaceTokens.current
-  val displayTitle = note.title.ifBlank { stringResource(R.string.note_untitled) }
+  val trimmedPreviewLines =
+    if (note.contentState is NoteContentState.Valid) {
+      note.plainTextPreview
+        .lineSequence()
+        .map { it.trim() }
+        .filter { it.isNotEmpty() }
+        .toList()
+    } else {
+      emptyList()
+    }
+  val hasExplicitTitle = note.title.isNotBlank()
+  val displayTitle =
+    if (hasExplicitTitle) {
+      note.title
+    } else {
+      trimmedPreviewLines.firstOrNull() ?: stringResource(R.string.note_untitled)
+    }
+  val bodyPreview =
+    if (hasExplicitTitle) {
+      note.plainTextPreview.trim()
+    } else {
+      trimmedPreviewLines.drop(1).joinToString(separator = "\n")
+    }
 
   Card(
+    onClick = onClick,
     shape = if (compact) MaterialTheme.shapes.small else MaterialTheme.shapes.medium,
     colors = CardDefaults.cardColors(containerColor = surfaceTokens.cardContainer),
     border = BorderStroke(1.dp, surfaceTokens.cardBorder),
@@ -190,10 +218,9 @@ private fun NotePreviewCard(
 
       when (val contentState = note.contentState) {
         is NoteContentState.Valid -> {
-          val preview = note.plainTextPreview.trim()
-          if (preview.isNotEmpty()) {
+          if (bodyPreview.isNotEmpty()) {
             Text(
-              text = preview,
+              text = bodyPreview,
               style = MaterialTheme.typography.bodyMedium,
               color = MaterialTheme.colorScheme.onSurfaceVariant,
               maxLines = maxPreviewLines,

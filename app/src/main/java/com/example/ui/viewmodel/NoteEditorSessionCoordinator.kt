@@ -34,6 +34,18 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
+interface EditorSessionCoordinator {
+  val uiState: StateFlow<NoteEditorUiState>
+
+  fun start(): Job
+
+  fun submit(command: SessionCommand): SubmitCommandResult
+
+  suspend fun awaitInitialized(): NoteEditorUiState
+
+  suspend fun closeAndAbort()
+}
+
 /**
  * Coordenador único da sessão do editor (Subetapa 4.3.3-D).
  *
@@ -56,7 +68,7 @@ class NoteEditorSessionCoordinator(
   private val autosaveDebounceMillis: Long = DEFAULT_AUTOSAVE_DEBOUNCE_MILLIS,
   private val sessionIdGenerator: () -> String = { UUID.randomUUID().toString() },
   private val engineBlockIdGenerator: () -> String = { UUID.randomUUID().toString() },
-) {
+) : EditorSessionCoordinator {
   init {
     require(autosaveDebounceMillis >= 0L) {
       "autosaveDebounceMillis não pode ser negativo: $autosaveDebounceMillis"
@@ -113,9 +125,9 @@ class NoteEditorSessionCoordinator(
   internal var transformStructuralResultForTest: ((StructuralRunnerResult) -> StructuralRunnerResult)? =
     null
 
-  val uiState: StateFlow<NoteEditorUiState> = mailbox.uiState
+  override val uiState: StateFlow<NoteEditorUiState> = mailbox.uiState
 
-  fun start(): Job {
+  override fun start(): Job {
     synchronized(lifecycleLock) {
       consumerJob?.let { return it }
       if (abortRequested) {
@@ -132,9 +144,9 @@ class NoteEditorSessionCoordinator(
     }
   }
 
-  fun submit(command: SessionCommand): SubmitCommandResult = mailbox.submit(command)
+  override fun submit(command: SessionCommand): SubmitCommandResult = mailbox.submit(command)
 
-  suspend fun awaitInitialized(): NoteEditorUiState = initializedDeferred.await()
+  override suspend fun awaitInitialized(): NoteEditorUiState = initializedDeferred.await()
 
   suspend fun awaitTerminated() {
     terminatedDeferred.await()
@@ -157,7 +169,7 @@ class NoteEditorSessionCoordinator(
   @VisibleForTesting
   internal fun isMailboxBarrierActiveForTest(): Boolean = mailbox.barrierActive
 
-  suspend fun closeAndAbort() {
+  override suspend fun closeAndAbort() {
     val jobToCancel: Job?
     synchronized(lifecycleLock) {
       abortRequested = true
@@ -370,6 +382,7 @@ class NoteEditorSessionCoordinator(
       is SessionCommand.SelectBlock -> {
         SessionMutationApplier.applyEditableCommand(rt, eng, cmd)
         publishCurrentRuntimeState(rt, eng)
+        cmd.ackDeferred?.complete(SessionCommandOutcome.Completed)
       }
       is SessionCommand.FolderAvailabilityObserved ->
         handleFolderAvailabilityObserved(rt, eng, cmd.availabilityById)
@@ -390,6 +403,8 @@ class NoteEditorSessionCoordinator(
         handleStructuralCommand(rt, eng, BarrierReason.CONFLICT_RESOLUTION, queued)
       is SessionCommand.DiscardDraftAndClose ->
         handleStructuralCommand(rt, eng, BarrierReason.DISCARD_DRAFT, queued)
+      is SessionCommand.PersistExistingNotePin ->
+        handleStructuralCommand(rt, eng, BarrierReason.PIN_UPDATE, queued)
       is SessionCommand.CloseSession ->
         shutdownCoordinator.handleGracefulCloseSession(
           rt = rt,
@@ -787,6 +802,8 @@ class NoteEditorSessionCoordinator(
                 )
               is SessionCommand.DiscardDraftAndClose ->
                 structuralRunner.runDiscardDraftAndClose(snapshotAtDispatch, exec)
+              is SessionCommand.PersistExistingNotePin ->
+                structuralRunner.runPersistExistingNotePin(cmd, snapshotAtDispatch)
               else ->
                 StructuralRunnerResult.Failed(
                   IllegalStateException("Comando inválido para barreira estrutural: $cmd")
@@ -1082,6 +1099,31 @@ class NoteEditorSessionCoordinator(
               initialIsPinned = false,
             )
           applyPromotedNewNoteState(rt, rec.newIdentity, rec.newLease, rec.newDraft, baseline)
+        }
+      }
+      is StructuralOutcomeData.ExistingNotePinUpdated -> {
+        val note = data.updatedNote
+        val currentBaseline = rt.baseline as? NoteEditorBaseline.ExistingNote
+        if (
+          currentBaseline != null &&
+            (note.revision == currentBaseline.baseRevision ||
+              note.revision == currentBaseline.baseRevision + 1L)
+        ) {
+          rt.baseline =
+            currentBaseline.copy(
+              baseRevision = note.revision,
+              baseNoteUpdatedAt = note.updatedAt,
+              currentDbIsPinned = note.isPinned,
+            )
+        }
+        rt.snapshot = rt.snapshot.copy(isPinned = note.isPinned)
+        rt.errorMessage = null
+        val eval = rt.evaluate()
+        val hasCheckpoint = executor?.snapshot()?.checkpointPresence == CheckpointPresence.PRESENT
+        if (eval.needsDraftRetention || hasCheckpoint) {
+          rt.stateGeneration += 1L
+          rt.autosaveStatus = AutosaveStatus.PendingDebounce
+          rescheduleAutosaveAfterInFlight = true
         }
       }
       StructuralOutcomeData.DiscardedAndClosed -> {

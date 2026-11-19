@@ -16,6 +16,7 @@ import com.example.domain.repository.InvalidRecoveryDraftException
 import com.example.domain.repository.NoteConflictException
 import com.example.domain.repository.NoteRecoveryDraftRepository
 import com.example.domain.repository.NoteRepository
+import com.example.domain.repository.PinNoteResult
 import java.io.IOException
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.atomic.AtomicInteger
@@ -2853,6 +2854,12 @@ class SingleFlightRoomPersistenceExecutorTest {
 
     override suspend fun setNotePinned(noteId: Long, pinned: Boolean) =
       throw UnsupportedOperationException()
+
+    override suspend fun setNotePinnedIfRevision(
+      noteId: Long,
+      pinned: Boolean,
+      expectedBaseRevision: Long,
+    ): PinNoteResult = throw UnsupportedOperationException()
 
     override suspend fun moveNoteToFolder(noteId: Long, folderId: Long?) =
       throw UnsupportedOperationException()

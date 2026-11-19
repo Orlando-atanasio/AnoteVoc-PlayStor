@@ -69,6 +69,17 @@ sealed interface RestoreFolderResult {
     RestoreFolderResult
 }
 
+sealed interface PinNoteResult {
+  data class Updated(val note: Note) : PinNoteResult
+
+  data class Unchanged(val note: Note) : PinNoteResult
+
+  data class Conflict(
+    val expectedRevision: Long,
+    val latestNote: Note,
+  ) : PinNoteResult
+}
+
 interface FolderRepository {
   fun observeActiveFolders(): Flow<List<Folder>>
   fun observeDeletedFolders(): Flow<List<Folder>>
@@ -107,6 +118,11 @@ interface NoteRepository {
   ): Note
   suspend fun updateNotePaperStyle(noteId: Long, paperStyle: NotePaperStyle): Note
   suspend fun setNotePinned(noteId: Long, pinned: Boolean)
+  suspend fun setNotePinnedIfRevision(
+    noteId: Long,
+    pinned: Boolean,
+    expectedBaseRevision: Long,
+  ): PinNoteResult
   suspend fun moveNoteToFolder(noteId: Long, folderId: Long?)
   suspend fun softDeleteNote(noteId: Long)
   suspend fun restoreNote(noteId: Long): Note
