@@ -270,13 +270,17 @@ internal class SessionStructuralRunner(
     val latestNote =
       noteRepository.getNoteById(targetNoteId)
         ?: return StructuralRunnerResult.Failed(
-          IllegalStateException("A nota $targetNoteId não foi encontrada para manter o rascunho.")
+          IllegalStateException(
+            "A nota $targetNoteId não foi encontrada para manter o rascunho."
+          )
         )
+
     if (latestNote.isDeleted) {
       return StructuralRunnerResult.Failed(
         IllegalStateException("A nota $targetNoteId está em Apagados.")
       )
     }
+
     val noteContent =
       (latestNote.contentState as? NoteContentState.Valid)?.document
         ?: return StructuralRunnerResult.Failed(
@@ -289,8 +293,13 @@ internal class SessionStructuralRunner(
         runtimeSnapshot.snapshot.effectiveFolderId,
         runtimeSnapshot.snapshot.fallbackSourceFolderId,
       )
+
     val folderMap =
-      if (folderIds.isEmpty()) emptyMap() else folderRepository.getFoldersByIds(folderIds)
+      if (folderIds.isEmpty()) {
+        emptyMap()
+      } else {
+        folderRepository.getFoldersByIds(folderIds)
+      }
 
     val rebasedBaseline =
       NoteEditorBaseline.ExistingNote(
@@ -298,23 +307,32 @@ internal class SessionStructuralRunner(
         baseRevision = latestNote.revision,
         baseNoteUpdatedAt = latestNote.updatedAt,
         title = latestNote.title,
-        normalizedContent = NoteEditorSessionEvaluator.canonicalizeDocument(noteContent),
+        normalizedContent =
+          NoteEditorSessionEvaluator.canonicalizeDocument(noteContent),
         paperStyle = latestNote.paperStyle,
         staticFolderId = latestNote.folderId,
         currentDbIsPinned = latestNote.isPinned,
       )
-    val rebasedSnapshot = runtimeSnapshot.snapshot.copy(isPinned = latestNote.isPinned)
-    val (_, rebasedContext) =
+
+    val originalSnapshot =
+      runtimeSnapshot.snapshot.copy(
+        isPinned = latestNote.isPinned,
+      )
+
+    // É obrigatório utilizar o snapshot atualizado retornado pela reconciliação.
+    val (rebasedSnapshot, rebasedContext) =
       NoteEditorSessionEvaluator.applyFolderAvailabilityToSnapshot(
-        snapshot = rebasedSnapshot,
+        snapshot = originalSnapshot,
         folderAvailabilityById = folderMap,
         previousContext = runtimeSnapshot.folderContext,
         baseline = rebasedBaseline,
       )
+
     val rebasedEval =
       NoteEditorSessionEvaluator.evaluateSession(
         NoteEditorSessionInputAlias(
-          lifecycleStage = com.example.domain.editor.SessionLifecycleStage.EDITING,
+          lifecycleStage =
+            com.example.domain.editor.SessionLifecycleStage.EDITING,
           baseline = rebasedBaseline,
           snapshot = rebasedSnapshot,
           folderContext = rebasedContext,
@@ -332,8 +350,11 @@ internal class SessionStructuralRunner(
               checkpointAt = null,
               resolvedFolderAvailability = folderMap,
               deletedCleanDraft = true,
+              rebasedSnapshot = rebasedSnapshot,
+              rebasedFolderContext = rebasedContext,
             )
           )
+
         is DeleteCheckpointExecutionResult.Failed ->
           StructuralRunnerResult.Failed(delRes.cause)
       }
@@ -352,6 +373,7 @@ internal class SessionStructuralRunner(
           baseRevision = latestNote.revision,
           baseNoteUpdatedAt = latestNote.updatedAt,
         )
+
       when (val saveRes = executor.saveCheckpoint(payload)) {
         is SaveCheckpointExecutionResult.Saved ->
           StructuralRunnerResult.Succeeded(
@@ -360,15 +382,23 @@ internal class SessionStructuralRunner(
               checkpointAt = saveRes.draft.checkpointAt,
               resolvedFolderAvailability = folderMap,
               deletedCleanDraft = false,
+              rebasedSnapshot = rebasedSnapshot,
+              rebasedFolderContext = rebasedContext,
             )
           )
-        is SaveCheckpointExecutionResult.Failed -> StructuralRunnerResult.Failed(saveRes.cause)
+
+        is SaveCheckpointExecutionResult.Failed ->
+          StructuralRunnerResult.Failed(saveRes.cause)
+
         is SaveCheckpointExecutionResult.IgnoredStaleRevision ->
           StructuralRunnerResult.Failed(
             IllegalStateException(
-              "Revisão obsoleta ao rebazar rascunho (${saveRes.attemptedCheckpointRevision} <= ${saveRes.persistedCheckpointRevision})."
+              "Revisão obsoleta ao rebazar rascunho " +
+                "(${saveRes.attemptedCheckpointRevision} <= " +
+                "${saveRes.persistedCheckpointRevision})."
             )
           )
+
         is SaveCheckpointExecutionResult.RevisionOverflow ->
           StructuralRunnerResult.Failed(
             IllegalStateException("Limite de revisões de checkpoint atingido.")

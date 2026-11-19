@@ -136,6 +136,9 @@ class NoteEditorSessionCoordinator(
 
   fun currentExecutorSnapshot(): PersistenceExecutorSnapshot? = executor?.snapshot()
 
+  internal fun currentRuntimeSnapshot(): SessionRuntimeState? =
+    runtime?.let { it.copy(knownFolderAvailability = it.knownFolderAvailability.toMutableMap()) }
+
   suspend fun closeAndAbort() {
     val jobToCancel: Job?
     synchronized(lifecycleLock) {
@@ -994,20 +997,38 @@ class NoteEditorSessionCoordinator(
       }
       is StructuralOutcomeData.KeptDraftOverCurrentNote -> {
         val note = data.latestNote
-        val noteDoc = (note.contentState as? NoteContentState.Valid)?.document ?: rt.snapshot.document
+        val noteDoc =
+          (note.contentState as? NoteContentState.Valid)?.document
+            ?: rt.snapshot.document
+        val previousEffectiveFolderId = rt.snapshot.effectiveFolderId
+
         rt.knownFolderAvailability.putAll(data.resolvedFolderAvailability)
+
         rt.baseline =
           NoteEditorBaseline.ExistingNote(
             noteId = note.id,
             baseRevision = note.revision,
             baseNoteUpdatedAt = note.updatedAt,
             title = note.title,
-            normalizedContent = NoteEditorSessionEvaluator.canonicalizeDocument(noteDoc),
+            normalizedContent =
+              NoteEditorSessionEvaluator.canonicalizeDocument(noteDoc),
             paperStyle = note.paperStyle,
             staticFolderId = note.folderId,
             currentDbIsPinned = note.isPinned,
           )
-        rt.snapshot = rt.snapshot.copy(isPinned = note.isPinned)
+
+        // Aplicar o mesmo snapshot e contexto reconciliados pelo runner.
+        // Não reconstruir o destino usando o estado antigo da sessão.
+        rt.snapshot = data.rebasedSnapshot
+        rt.folderContext = data.rebasedFolderContext
+        rt.effectiveFolderName =
+          SessionOpenLoader.resolveEffectiveFolderName(
+            effectiveFolderId = data.rebasedSnapshot.effectiveFolderId,
+            folderContext = data.rebasedFolderContext,
+            previousEffectiveFolderId = previousEffectiveFolderId,
+            previousEffectiveFolderName = rt.effectiveFolderName,
+          )
+
         rt.activeConflict = null
         rt.errorMessage = null
         rt.needsInitialPersistOnOpen = false

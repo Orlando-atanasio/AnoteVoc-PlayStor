@@ -185,6 +185,8 @@ internal sealed interface StructuralOutcomeData {
     val checkpointAt: Long?,
     val resolvedFolderAvailability: Map<Long, FolderAvailability>,
     val deletedCleanDraft: Boolean,
+    val rebasedSnapshot: com.example.domain.editor.NoteEditorEditableSnapshot,
+    val rebasedFolderContext: com.example.domain.editor.ResolvedDraftFolderContext,
   ) : StructuralOutcomeData
 
   data class DiscardedDraftToCurrentNote(

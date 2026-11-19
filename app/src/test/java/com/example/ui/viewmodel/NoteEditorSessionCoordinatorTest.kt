@@ -611,6 +611,216 @@ class NoteEditorSessionCoordinatorTest {
   }
 
   @Test
+  fun conflictResolution_keepDraftWhenSelectedFolderUnavailable_savesRebasedFallbackCheckpoint() =
+    runTest {
+      val h = CoordinatorHarness(this)
+      val selectedFolder = h.folderRepo.seedFolder(id = 44L, name = "Temporária", isDeleted = false)
+      val note = h.noteRepo.seedNote(id = 34L, title = "Nota Original", folderId = selectedFolder.id, revision = 1L)
+      val coord =
+        h.createCoordinator(
+          openRequest = NoteEditorOpenRequest.OpenExisting(noteId = note.id, sessionId = "conflict-keep-folder"),
+          parentScope = this,
+        )
+      try {
+        coord.start()
+        testScheduler.runCurrent()
+        val opened = coord.awaitInitialized()
+        assertEquals(selectedFolder.id, opened.effectiveFolderId)
+        assertEquals("Temporária", opened.effectiveFolderName)
+
+        submitMutation(coord, SessionCommand.EditTitle("Rascunho em pasta apagada"))
+        assertEquals(SessionCommandOutcome.Completed, submitAndAwait(coord) { SessionCommand.FlushAutosave(it) })
+
+        // Nota diverge no banco (inclusive fixação atualizada externamente) enquanto a pasta ainda está ativa para disparar NoteDiverged.
+        h.noteRepo.notes[note.id] =
+          note.copy(
+            title = "Versão externa",
+            revision = 3L,
+            updatedAt = 15_000L,
+            isPinned = true,
+          )
+
+        val failedConsolidate = submitAndAwait(coord) { SessionCommand.ConsolidateNote(ackDeferred = it) }
+        assertTrue(failedConsolidate is SessionCommandOutcome.Failed)
+        assertTrue(coord.uiState.value.activeConflict is RecoveryConflict.NoteDiverged)
+
+        // Agora a pasta selecionada vai para a lixeira antes da resolução KEEP_DRAFT_OVER_CURRENT_NOTE.
+        h.folderRepo.folders[selectedFolder.id] = selectedFolder.copy(isDeleted = true, deletedAt = 16_000L)
+
+        assertEquals(
+          SessionCommandOutcome.Completed,
+          submitAndAwait(coord) {
+            SessionCommand.ResolveConflict(ConflictResolutionOption.KEEP_DRAFT_OVER_CURRENT_NOTE, it)
+          },
+        )
+
+        val draftId = coord.uiState.value.sessionIdentity!!.draftId
+        val persisted = h.draftRepo.getCheckpointById(draftId)
+        assertNotNull(persisted)
+        assertNull(persisted!!.folderId)
+        assertEquals(selectedFolder.id, persisted.fallbackSourceFolderId)
+        assertEquals(3L, persisted.baseRevision)
+        assertEquals(15_000L, persisted.baseNoteUpdatedAt)
+        assertTrue(persisted.isPinned)
+        assertEquals("Rascunho em pasta apagada", persisted.title)
+
+        // 1, 2, 3, 4, 5: Estado em memória (SessionRuntimeState) atualizado com snapshot/contexto reconciliados e baseline atual.
+        val runtimeState = coord.currentRuntimeSnapshot()!!
+        assertNull(runtimeState.snapshot.effectiveFolderId)
+        assertEquals(selectedFolder.id, runtimeState.snapshot.fallbackSourceFolderId)
+        assertTrue(runtimeState.snapshot.isPinned)
+        assertEquals("Rascunho em pasta apagada", runtimeState.snapshot.title)
+        assertEquals(FolderAvailability.Root, runtimeState.folderContext.effectiveTarget)
+        assertTrue(runtimeState.folderContext.fallbackSource is FolderAvailability.InTrash)
+        assertTrue(runtimeState.folderContext.initialBaseline is FolderAvailability.InTrash)
+        assertTrue(runtimeState.folderContext.existingNoteFolder is FolderAvailability.InTrash)
+        assertNull(runtimeState.effectiveFolderName)
+
+        val runtimeBaseline = runtimeState.baseline as NoteEditorBaseline.ExistingNote
+        assertEquals(note.id, runtimeBaseline.noteId)
+        assertEquals(3L, runtimeBaseline.baseRevision)
+        assertEquals(15_000L, runtimeBaseline.baseNoteUpdatedAt)
+        assertEquals("Versão externa", runtimeBaseline.title)
+        assertEquals(selectedFolder.id, runtimeBaseline.staticFolderId)
+        assertTrue(runtimeBaseline.currentDbIsPinned)
+
+        // 5 e 7: Estado publicado pelo coordenador reflete a reconciliação e coincide com o checkpoint persistido.
+        val published = coord.uiState.value
+        assertNull(published.activeConflict)
+        assertNull(published.effectiveFolderId)
+        assertNull(published.effectiveFolderName)
+        assertEquals(selectedFolder.id, published.fallbackSourceFolderId)
+        assertEquals(persisted.folderId, published.effectiveFolderId)
+        assertEquals(persisted.fallbackSourceFolderId, published.fallbackSourceFolderId)
+        assertEquals(selectedFolder.id, published.intendedUserFolderId)
+        assertTrue(published.hasPendingFolderFallback)
+        assertTrue(published.hasUnsavedChanges)
+        assertTrue(published.isPinned)
+        assertEquals(runtimeBaseline, published.baseline)
+        assertTrue(published.needsExplicitFolderConfirmation)
+        val readiness = published.consolidationReadiness as ConsolidationReadiness.RequiresExplicitFolderConfirmation
+        assertEquals(selectedFolder.id, readiness.fallbackSourceFolderId)
+        assertTrue(readiness.fallbackSourceAvailability is FolderAvailability.InTrash)
+        assertTrue(
+          published.warnings.any {
+            it is SessionWarning.FallbackFolderApplied &&
+              it.originalFolderId == selectedFolder.id &&
+              it.availability is FolderAvailability.InTrash
+          }
+        )
+
+        // Consistência subsequente: nova edição + FlushAutosave não ressuscita a pasta antiga em memória.
+        submitMutation(coord, SessionCommand.EditTitle("Edição subsequente"))
+        assertEquals(SessionCommandOutcome.Completed, submitAndAwait(coord) { SessionCommand.FlushAutosave(it) })
+        val secondCheckpoint = h.draftRepo.getCheckpointById(draftId)!!
+        assertNull(secondCheckpoint.folderId)
+        assertEquals(selectedFolder.id, secondCheckpoint.fallbackSourceFolderId)
+        assertEquals("Edição subsequente", secondCheckpoint.title)
+
+        // Sem allowFallbackToRoot = true, consolidação continua exigindo confirmação explícita pelo contexto reconciliado.
+        val consolidateBlocked =
+          submitAndAwait(coord) { SessionCommand.ConsolidateNote(allowFallbackToRoot = false, ackDeferred = it) }
+        assertTrue(consolidateBlocked is SessionCommandOutcome.Failed)
+      } finally {
+        coord.closeAndAbort()
+        testScheduler.runCurrent()
+      }
+    }
+
+  @Test
+  fun conflictResolution_keepDraftOverCurrentNote_cleanDraftDeletion_updatesSnapshotContextAndFolderName() =
+    runTest {
+      val h = CoordinatorHarness(this)
+      val folder = h.folderRepo.seedFolder(id = 55L, name = "Nome Antigo", isDeleted = false)
+      val note =
+        h.noteRepo.seedNote(
+          id = 35L,
+          title = "Título Inicial",
+          folderId = folder.id,
+          revision = 1L,
+          isPinned = false,
+          text = "Corpo convergente",
+        )
+      val coord =
+        h.createCoordinator(
+          openRequest = NoteEditorOpenRequest.OpenExisting(noteId = note.id, sessionId = "conflict-keep-clean"),
+          parentScope = this,
+        )
+      try {
+        coord.start()
+        testScheduler.runCurrent()
+        val opened = coord.awaitInitialized()
+        assertEquals("Nome Antigo", opened.effectiveFolderName)
+
+        // Usuário edita título e persiste checkpoint.
+        submitMutation(coord, SessionCommand.EditTitle("Título Convergente"))
+        assertEquals(SessionCommandOutcome.Completed, submitAndAwait(coord) { SessionCommand.FlushAutosave(it) })
+        val draftId = coord.uiState.value.sessionIdentity!!.draftId
+        assertNotNull(h.draftRepo.getCheckpointById(draftId))
+
+        // Banco diverge adotando o mesmo título/conteúdo + pin atualizado externamente.
+        h.noteRepo.notes[note.id] =
+          note.copy(
+            title = "Título Convergente",
+            revision = 4L,
+            updatedAt = 25_000L,
+            isPinned = true,
+          )
+        val failedConsolidate = submitAndAwait(coord) { SessionCommand.ConsolidateNote(ackDeferred = it) }
+        assertTrue(failedConsolidate is SessionCommandOutcome.Failed)
+        assertTrue(coord.uiState.value.activeConflict is RecoveryConflict.NoteDiverged)
+
+        // Pasta é renomeada no repositório antes de KEEP_DRAFT_OVER_CURRENT_NOTE; como após rebase não há
+        // diferenças retidas, o checkpoint limpo é excluído.
+        val renamedFolder = folder.copy(name = "Nome Atualizado", normalizedName = "nome atualizado", updatedAt = 26_000L)
+        h.folderRepo.folders[folder.id] = renamedFolder
+
+        assertEquals(
+          SessionCommandOutcome.Completed,
+          submitAndAwait(coord) {
+            SessionCommand.ResolveConflict(ConflictResolutionOption.KEEP_DRAFT_OVER_CURRENT_NOTE, it)
+          },
+        )
+
+        // Checkpoint limpo foi excluído.
+        assertNull(h.draftRepo.getCheckpointById(draftId))
+
+        // Snapshot, folderContext, effectiveFolderName e baseline em memória refletem a reconciliação.
+        val runtimeState = coord.currentRuntimeSnapshot()!!
+        assertEquals(folder.id, runtimeState.snapshot.effectiveFolderId)
+        assertNull(runtimeState.snapshot.fallbackSourceFolderId)
+        assertTrue(runtimeState.snapshot.isPinned)
+        assertEquals(FolderAvailability.Active(renamedFolder), runtimeState.folderContext.effectiveTarget)
+        assertNull(runtimeState.folderContext.fallbackSource)
+        assertEquals(FolderAvailability.Active(renamedFolder), runtimeState.folderContext.existingNoteFolder)
+        assertEquals("Nome Atualizado", runtimeState.effectiveFolderName)
+
+        val baseline = runtimeState.baseline as NoteEditorBaseline.ExistingNote
+        assertEquals(4L, baseline.baseRevision)
+        assertEquals(25_000L, baseline.baseNoteUpdatedAt)
+        assertEquals("Título Convergente", baseline.title)
+        assertEquals(folder.id, baseline.staticFolderId)
+        assertTrue(baseline.currentDbIsPinned)
+
+        // Estado publicado pelo coordenador atualizado sem referências antigas.
+        val published = coord.uiState.value
+        assertNull(published.activeConflict)
+        assertEquals(AutosaveStatus.Idle, published.autosaveStatus)
+        assertFalse(published.hasUnsavedChanges)
+        assertEquals(folder.id, published.effectiveFolderId)
+        assertNull(published.fallbackSourceFolderId)
+        assertEquals("Nome Atualizado", published.effectiveFolderName)
+        assertTrue(published.isPinned)
+        assertEquals(baseline, published.baseline)
+        assertEquals(ConsolidationReadiness.Ready(folder.id), published.consolidationReadiness)
+        assertTrue(published.isSessionFullySynced)
+      } finally {
+        coord.closeAndAbort()
+        testScheduler.runCurrent()
+      }
+    }
+
+  @Test
   fun saveDraftAsNewNote_indeterminateStatesA_B_C_D_E_F_andRetryRecovery() = runTest {
     val h = CoordinatorHarness(this)
     val note = h.noteRepo.seedNote(id = 70L, title = "Nota 70", revision = 1L)
