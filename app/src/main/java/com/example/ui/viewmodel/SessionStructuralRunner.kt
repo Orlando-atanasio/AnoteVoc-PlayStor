@@ -587,13 +587,38 @@ internal class SessionStructuralRunner(
               context = context,
               forShutdown = false,
             )
-          if (reconciled is ReplacementReconciliationResult.PromotedToNew) {
-            onLeaseCommitted(reconciled.newLease)
+          return when (reconciled) {
+            is ReplacementReconciliationResult.PromotedToNew -> {
+              onLeaseCommitted(reconciled.newLease)
+              onPendingReplacementSet(null)
+
+              StructuralRunnerResult.Succeeded(
+                StructuralOutcomeData.ReconciledIndeterminate(reconciled)
+              )
+            }
+
+            is ReplacementReconciliationResult.RevertedToOld,
+            is ReplacementReconciliationResult.NeitherPresent,
+            is ReplacementReconciliationResult.DivergentAnomaly -> {
+              onPendingReplacementSet(null)
+
+              StructuralRunnerResult.Failed(
+                cause =
+                  IllegalStateException(
+                    "Commit no Registry falhou após substituição no Room."
+                  ),
+                fallbackData = StructuralOutcomeData.ReconciledIndeterminate(reconciled),
+              )
+            }
+
+            is ReplacementReconciliationResult.IndeterminateReadFailure -> {
+              // Preservar o contexto pendente para uma reconciliação posterior.
+              StructuralRunnerResult.Failed(
+                cause = reconciled.cause,
+                fallbackData = StructuralOutcomeData.ReconciledIndeterminate(reconciled),
+              )
+            }
           }
-          StructuralRunnerResult.Failed(
-            cause = IllegalStateException("Commit no Registry falhou após substituição no Room."),
-            fallbackData = StructuralOutcomeData.ReconciledIndeterminate(reconciled),
-          )
         }
       }
     }

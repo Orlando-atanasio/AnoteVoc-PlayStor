@@ -18,6 +18,7 @@ internal class SessionShutdownCoordinator(
     inFlightOpProvider: () -> InFlightOperation?,
     clearInFlightOp: () -> Unit,
     uncommittedReplacement: AtomicReference<UncommittedReplacementContext?>,
+    latestCommittedLease: AtomicReference<SessionLeaseToken?>,
     cancelDebounce: () -> Unit,
     drainCompletion: suspend (PersistenceCompletion) -> Unit,
     publishState: (SessionRuntimeState, NoteEditorEngine) -> NoteEditorUiState,
@@ -59,6 +60,7 @@ internal class SessionShutdownCoordinator(
           is ReplacementReconciliationResult.PromotedToNew -> {
             uncommittedReplacement.set(null)
             rt.lease = recResult.newLease
+            latestCommittedLease.set(recResult.newLease)
             rt.identity = recResult.newIdentity
             rt.lastCheckpointAt = recResult.newDraft.checkpointAt
             rt.isSessionTerminated = true
@@ -76,6 +78,7 @@ internal class SessionShutdownCoordinator(
           is ReplacementReconciliationResult.RevertedToOld -> {
             uncommittedReplacement.set(null)
             rt.lease = recResult.preservedLease
+            latestCommittedLease.set(recResult.preservedLease)
             rt.isSessionTerminated = true
             publishState(rt, eng)
             finalizeGracefulShutdown(

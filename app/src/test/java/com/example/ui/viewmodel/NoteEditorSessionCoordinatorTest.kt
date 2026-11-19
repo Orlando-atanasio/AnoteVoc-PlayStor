@@ -48,6 +48,7 @@ import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.withTimeout
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
@@ -1150,6 +1151,431 @@ class NoteEditorSessionCoordinatorTest {
         h.handoffTracker.findActiveCandidate(oldDraftId)?.status,
       )
       assertNotNull(h.draftRepo.getCheckpointById(NoteRecoveryDraftKeys.forNewNote("abort-rec-new")))
+    }
+
+  @Test
+  fun saveDraftAsNewNote_whenApplyStructuralFailureReceivesPromotedToNew_promotesRuntimeCompletesCommandAndReleasesBarrier() =
+    runTest {
+      val h = CoordinatorHarness(this)
+      val folder = h.folderRepo.seedFolder(id = 44L, name = "Projetos")
+      val note = h.noteRepo.seedNote(id = 89L, title = "Nota Original 89", folderId = folder.id, revision = 1L)
+      var generatedCounter = 0
+
+      val coord =
+        h.createCoordinator(
+          openRequest = NoteEditorOpenRequest.OpenExisting(noteId = note.id, sessionId = "fail-promoted-old"),
+          parentScope = this,
+          sessionIdProvider = { "fail-promoted-new-${++generatedCounter}" },
+        )
+      try {
+        coord.start()
+        testScheduler.runCurrent()
+        coord.awaitInitialized()
+
+        submitMutation(coord, SessionCommand.EditTitle("Título Editado Preservado"))
+        submitMutation(coord, SessionCommand.InsertText("Conteúdo editado preservado"))
+        submitMutation(coord, SessionCommand.ChangePaperStyle(NotePaperStyle.PONTILHADO))
+        submitMutation(coord, SessionCommand.SetPinned(true))
+        assertEquals(
+          SessionCommandOutcome.Completed,
+          submitAndAwait(coord) { SessionCommand.FlushAutosave(it) },
+        )
+
+        val oldRuntime = coord.currentRuntimeSnapshot()!!
+        val oldLease = oldRuntime.lease
+        val oldDraftId = oldRuntime.identity.draftId
+
+        // Diverge nota no banco e força conflito antes da promoção.
+        h.noteRepo.notes[note.id] = note.copy(revision = 2L, updatedAt = 25_000L)
+        val consolidateOutcome = submitAndAwait(coord) { SessionCommand.ConsolidateNote(ackDeferred = it) }
+        assertTrue(consolidateOutcome is SessionCommandOutcome.Failed)
+        assertTrue(coord.uiState.value.activeConflict is RecoveryConflict.NoteDiverged)
+
+        // Simula falha após commit no Room (gerando ReconciledIndeterminate(PromotedToNew))
+        // e entrega esse resultado especificamente pelo caminho de falha (applyStructuralFailure).
+        var injectedFault = false
+        h.draftRepo.onReplaceHook = { oldId, newInput ->
+          val res = h.draftRepo.defaultReplace(oldId, newInput)
+          if (!injectedFault) {
+            injectedFault = true
+            throw IOException("Queda pós-commit simulada")
+          }
+          res
+        }
+        coord.transformStructuralResultForTest = { raw ->
+          val succ = raw as StructuralRunnerResult.Succeeded
+          StructuralRunnerResult.Failed(
+            cause = IllegalStateException("Falha simulada para exercitar applyStructuralFailure"),
+            fallbackData = succ.data,
+          )
+        }
+
+        val resolveOutcome =
+          submitAndAwait(coord) {
+            SessionCommand.ResolveConflict(ConflictResolutionOption.SAVE_DRAFT_AS_NEW_NOTE, it)
+          }
+
+        assertEquals(SessionCommandOutcome.Completed, resolveOutcome)
+        val expectedNewDraftId = NoteRecoveryDraftKeys.forNewNote("fail-promoted-new-1")
+
+        // 1 e 2. runtime.identity, runtime.lease e latestCommittedLease atualizados para a nova identidade/lease.
+        val rtAfter = coord.currentRuntimeSnapshot()!!
+        assertEquals(expectedNewDraftId, rtAfter.identity.draftId)
+        assertEquals("fail-promoted-new-1", rtAfter.identity.sessionId)
+        assertNull(rtAfter.identity.targetNoteId)
+        assertNotEquals(oldLease, rtAfter.lease)
+        assertEquals(rtAfter.lease, coord.latestCommittedLeaseForTest())
+
+        // 3. baseline convertido para NewNote mantendo metadados iniciais do rascunho.
+        val newBaseline = rtAfter.baseline as NoteEditorBaseline.NewNote
+        assertEquals("", newBaseline.title)
+        assertEquals(NotePaperStyle.PONTILHADO, newBaseline.paperStyle)
+        assertEquals(folder.id, newBaseline.staticFolderId)
+        assertFalse(newBaseline.initialIsPinned)
+
+        // 4, 5, 6 e 7. snapshot, conteúdo, estado publicado, ausência de conflito/erro e AutosaveStatus.Saved.
+        assertEquals("Título Editado Preservado", rtAfter.snapshot.title)
+        assertTrue(rtAfter.snapshot.isPinned)
+        assertEquals(NotePaperStyle.PONTILHADO, rtAfter.snapshot.paperStyle)
+        assertEquals(folder.id, rtAfter.snapshot.effectiveFolderId)
+
+        val published = coord.uiState.value
+        assertEquals(expectedNewDraftId, published.sessionIdentity!!.draftId)
+        assertEquals("fail-promoted-new-1", published.sessionIdentity!!.sessionId)
+        assertNull(published.sessionIdentity!!.targetNoteId)
+        assertEquals("Título Editado Preservado", published.title)
+        assertEquals("Conteúdo editado preservado", published.editorState.document.blocks.single().text)
+        assertEquals(folder.name, published.effectiveFolderName)
+        assertNull(published.activeConflict)
+        assertNull(published.errorMessage)
+        assertTrue(published.autosaveStatus is AutosaveStatus.Saved)
+
+        // 8 e 9. Barreira liberada, uncommittedReplacement limpo e fluxo normal continua na mesma sessão promovida.
+        assertFalse(coord.hasPendingBarrierForTest())
+        assertFalse(coord.isMailboxBarrierActiveForTest())
+        assertFalse(coord.hasUncommittedReplacementForTest())
+        assertTrue(h.registry.isSessionReserved("fail-promoted-new-1"))
+        assertFalse(h.registry.isSessionReserved("fail-promoted-old"))
+        assertEquals(
+          ReplacementHandoffStatus.RESOLVED_TO_NEW,
+          h.handoffTracker.findActiveCandidate(oldDraftId)?.status,
+        )
+
+        coord.transformStructuralResultForTest = null
+        h.draftRepo.onReplaceHook = null
+        submitMutation(coord, SessionCommand.EditTitle("Edição Pós-Promoção"))
+        val flushAfter = submitAndAwait(coord) { SessionCommand.FlushAutosave(it) }
+        assertEquals(SessionCommandOutcome.Completed, flushAfter)
+        assertEquals(1, generatedCounter)
+        assertEquals(expectedNewDraftId, coord.uiState.value.sessionIdentity!!.draftId)
+        assertEquals("Edição Pós-Promoção", h.draftRepo.getCheckpointById(expectedNewDraftId)?.title)
+        assertNull(h.draftRepo.getCheckpointById(oldDraftId))
+      } finally {
+        coord.closeAndAbort()
+        testScheduler.runCurrent()
+      }
+      assertEquals(0, h.registry.snapshot().reservedSessionIds.size)
+    }
+
+  @Test
+  fun saveDraftAsNewNote_whenIndeterminateReadFailureOccurs_preservesUncommittedReplacementBlocksNewTransfersAndRecovers() =
+    runTest {
+      val h = CoordinatorHarness(this)
+      val note = h.noteRepo.seedNote(id = 90L, title = "Nota 90", revision = 1L)
+      var generatedCounter = 0
+
+      val coord =
+        h.createCoordinator(
+          openRequest = NoteEditorOpenRequest.OpenExisting(noteId = note.id, sessionId = "indet-read-old"),
+          parentScope = this,
+          sessionIdProvider = { "indet-read-new-${++generatedCounter}" },
+        )
+      try {
+        coord.start()
+        testScheduler.runCurrent()
+        coord.awaitInitialized()
+        submitMutation(coord, SessionCommand.EditTitle("Conteúdo pendente"))
+        assertEquals(SessionCommandOutcome.Completed, submitAndAwait(coord) { SessionCommand.FlushAutosave(it) })
+        val oldIdentity = coord.uiState.value.sessionIdentity!!
+        val oldLease = coord.currentRuntimeSnapshot()!!.lease
+
+        h.noteRepo.notes[note.id] = note.copy(revision = 2L, updatedAt = 30_000L)
+        assertTrue(submitAndAwait(coord) { SessionCommand.ConsolidateNote(ackDeferred = it) } is SessionCommandOutcome.Failed)
+
+        h.draftRepo.onReplaceHook = { oldId, newInput ->
+          h.draftRepo.defaultReplace(oldId, newInput)
+          throw IOException("Queda após commit no SQLite")
+        }
+        h.draftRepo.onGetCheckpointHook = { throw IOException("Falha de leitura na reconciliação") }
+
+        val firstOutcome =
+          submitAndAwait(coord) {
+            SessionCommand.ResolveConflict(ConflictResolutionOption.SAVE_DRAFT_AS_NEW_NOTE, it)
+          }
+        assertTrue(firstOutcome is SessionCommandOutcome.Failed)
+        assertTrue(coord.hasUncommittedReplacementForTest())
+        assertEquals(oldIdentity, coord.currentRuntimeSnapshot()!!.identity)
+        assertEquals(oldLease, coord.currentRuntimeSnapshot()!!.lease)
+        assertEquals(oldLease, coord.latestCommittedLeaseForTest())
+        val errStatus = coord.uiState.value.autosaveStatus as AutosaveStatus.Error
+        assertFalse(errStatus.isTerminal)
+
+        // Bloqueia operações estruturais e autosave enquanto indeterminado.
+        assertTrue(submitAndAwait(coord) { SessionCommand.FlushAutosave(it) } is SessionCommandOutcome.Failed)
+        assertTrue(submitAndAwait(coord) { SessionCommand.ConsolidateNote(ackDeferred = it) } is SessionCommandOutcome.Failed)
+        assertTrue(submitAndAwait(coord) { SessionCommand.DiscardDraftAndClose(it) } is SessionCommandOutcome.Failed)
+
+        // Bloqueia segunda transferência concorrente no ActiveSessionRegistry sem chamar replaceCheckpointWithNewNote.
+        val replaceCountBeforeRetry = h.draftRepo.replaceCount.get()
+        val retryTransferOutcome =
+          submitAndAwait(coord) {
+            SessionCommand.ResolveConflict(ConflictResolutionOption.SAVE_DRAFT_AS_NEW_NOTE, it)
+          }
+        assertTrue(retryTransferOutcome is SessionCommandOutcome.Failed)
+        assertEquals(replaceCountBeforeRetry, h.draftRepo.replaceCount.get())
+        assertEquals(1, h.registry.snapshot().pendingTransferCount)
+        assertTrue(coord.hasUncommittedReplacementForTest())
+      } finally {
+        coord.closeAndAbort()
+        testScheduler.runCurrent()
+      }
+      assertEquals(0, h.registry.snapshot().reservedSessionIds.size)
+    }
+
+  @Test
+  fun saveDraftAsNewNote_whenReconciledAsRevertedNeitherPresentOrDivergent_clearsPendingContextAndNeverPromotes() =
+    runTest {
+      suspend fun assertNonPromotedCase(
+        sessionId: String,
+        expectTerminalError: Boolean,
+        expectConflictRemains: Boolean,
+        hook: suspend CoordinatorHarness.(String, NoteRecoveryDraftInput) -> ReplaceCheckpointWithNewNoteResult,
+      ) {
+        val h = CoordinatorHarness(this)
+        val note = h.noteRepo.seedNote(id = 91L, title = "Nota 91", revision = 1L)
+        val coord =
+          h.createCoordinator(
+            openRequest = NoteEditorOpenRequest.OpenExisting(noteId = note.id, sessionId = sessionId),
+            parentScope = this,
+            sessionIdProvider = { "$sessionId-new" },
+          )
+        try {
+          coord.start()
+          testScheduler.runCurrent()
+          coord.awaitInitialized()
+          submitMutation(coord, SessionCommand.EditTitle("Draft $sessionId"))
+          assertEquals(SessionCommandOutcome.Completed, submitAndAwait(coord) { SessionCommand.FlushAutosave(it) })
+          val oldIdentity = coord.uiState.value.sessionIdentity!!
+          val oldLease = coord.currentRuntimeSnapshot()!!.lease
+
+          h.noteRepo.notes[note.id] = note.copy(revision = 2L, updatedAt = 35_000L)
+          assertTrue(submitAndAwait(coord) { SessionCommand.ConsolidateNote(ackDeferred = it) } is SessionCommandOutcome.Failed)
+
+          h.draftRepo.onReplaceHook = { oldId, newInput -> h.hook(oldId, newInput) }
+          val outcome =
+            submitAndAwait(coord) {
+              SessionCommand.ResolveConflict(ConflictResolutionOption.SAVE_DRAFT_AS_NEW_NOTE, it)
+            }
+
+          assertTrue(outcome is SessionCommandOutcome.Failed)
+          assertFalse(coord.hasUncommittedReplacementForTest())
+          assertEquals(oldIdentity, coord.currentRuntimeSnapshot()!!.identity)
+          assertEquals(oldLease, coord.currentRuntimeSnapshot()!!.lease)
+          assertEquals(oldLease, coord.latestCommittedLeaseForTest())
+          assertTrue(h.registry.isSessionReserved(sessionId))
+          assertFalse(h.registry.isSessionReserved("$sessionId-new"))
+          if (expectTerminalError) {
+            val status = coord.uiState.value.autosaveStatus as AutosaveStatus.Error
+            assertTrue(status.isTerminal)
+          } else {
+            assertEquals(AutosaveStatus.HeldPendingResolution, coord.uiState.value.autosaveStatus)
+          }
+          if (expectConflictRemains) {
+            assertNotNull(coord.uiState.value.activeConflict)
+          }
+        } finally {
+          coord.closeAndAbort()
+          testScheduler.runCurrent()
+        }
+        assertEquals(0, h.registry.snapshot().reservedSessionIds.size)
+      }
+
+      assertNonPromotedCase(
+        sessionId = "coord-d-reverted",
+        expectTerminalError = false,
+        expectConflictRemains = true,
+      ) { _, _ -> throw IOException("Falha antes do replace") }
+
+      assertNonPromotedCase(
+        sessionId = "coord-d-neither",
+        expectTerminalError = true,
+        expectConflictRemains = true,
+      ) { oldId, _ ->
+        draftRepo.drafts.remove(oldId)
+        throw IOException("Sumiu tudo")
+      }
+
+      assertNonPromotedCase(
+        sessionId = "coord-d-divergent",
+        expectTerminalError = true,
+        expectConflictRemains = true,
+      ) { oldId, newInput ->
+        draftRepo.defaultReplace(oldId, newInput.copy(title = "Adulterado"))
+        throw IOException("Divergente")
+      }
+    }
+
+  @Test
+  fun closeSession_withPendingReplacementReconciledAsPromotedToNew_updatesLatestCommittedLeaseAndReleasesNewLease() =
+    runTest {
+      val h = CoordinatorHarness(this)
+      val note = h.noteRepo.seedNote(id = 92L, title = "Nota 92", revision = 1L)
+      val coord =
+        h.createCoordinator(
+          openRequest = NoteEditorOpenRequest.OpenExisting(noteId = note.id, sessionId = "close-prom-old"),
+          parentScope = this,
+          sessionIdProvider = { "close-prom-new" },
+        )
+      coord.start()
+      testScheduler.runCurrent()
+      coord.awaitInitialized()
+
+      submitMutation(coord, SessionCommand.EditTitle("Draft para fechar promovido"))
+      assertEquals(SessionCommandOutcome.Completed, submitAndAwait(coord) { SessionCommand.FlushAutosave(it) })
+      val oldLease = coord.currentRuntimeSnapshot()!!.lease
+
+      h.noteRepo.notes[note.id] = note.copy(revision = 2L, updatedAt = 40_000L)
+      assertTrue(submitAndAwait(coord) { SessionCommand.ConsolidateNote(ackDeferred = it) } is SessionCommandOutcome.Failed)
+
+      // 1ª etapa: replace ocorre no Room, mas reconciliação falha na leitura (Estado F -> deixa uncommittedReplacement ativo).
+      h.draftRepo.onReplaceHook = { oldId, newInput ->
+        h.draftRepo.defaultReplace(oldId, newInput)
+        throw IOException("Falha pós-commit no Room")
+      }
+      h.draftRepo.onGetCheckpointHook = { throw IOException("Falha temporária de leitura") }
+      assertTrue(
+        submitAndAwait(coord) {
+          SessionCommand.ResolveConflict(ConflictResolutionOption.SAVE_DRAFT_AS_NEW_NOTE, it)
+        } is SessionCommandOutcome.Failed
+      )
+      assertTrue(coord.hasUncommittedReplacementForTest())
+      assertEquals(oldLease, coord.latestCommittedLeaseForTest())
+
+      // 2ª etapa: leitura/execução no Room se recuperam e CloseSession reconcilia como PromotedToNew.
+      h.draftRepo.onReplaceHook = null
+      h.draftRepo.onGetCheckpointHook = null
+      val closeOutcome = submitAndAwait(coord) { SessionCommand.CloseSession(it) }
+      coord.awaitTerminated()
+
+      assertEquals(SessionCommandOutcome.Completed, closeOutcome)
+      val promotedLease = coord.latestCommittedLeaseForTest()!!
+      assertNotEquals(oldLease, promotedLease)
+      assertEquals(promotedLease, coord.currentRuntimeSnapshot()!!.lease)
+      assertEquals(NoteRecoveryDraftKeys.forNewNote("close-prom-new"), coord.uiState.value.sessionIdentity!!.draftId)
+      assertFalse(coord.hasUncommittedReplacementForTest())
+      assertFalse(h.registry.isLeaseActive(promotedLease))
+      assertFalse(h.registry.isLeaseActive(oldLease))
+      assertTrue(h.registry.snapshot().reservedSessionIds.isEmpty())
+      assertTrue(h.registry.snapshot().reservedDraftIds.isEmpty())
+    }
+
+  @Test
+  fun closeSession_withPendingReplacementReconciledAsRevertedToOld_updatesLatestCommittedLeaseAndReleasesPreservedLease() =
+    runTest {
+      val h = CoordinatorHarness(this)
+      val note = h.noteRepo.seedNote(id = 93L, title = "Nota 93", revision = 1L)
+      val coord =
+        h.createCoordinator(
+          openRequest = NoteEditorOpenRequest.OpenExisting(noteId = note.id, sessionId = "close-rev-old"),
+          parentScope = this,
+          sessionIdProvider = { "close-rev-new" },
+        )
+      coord.start()
+      testScheduler.runCurrent()
+      coord.awaitInitialized()
+
+      submitMutation(coord, SessionCommand.EditTitle("Draft para fechar revertido"))
+      assertEquals(SessionCommandOutcome.Completed, submitAndAwait(coord) { SessionCommand.FlushAutosave(it) })
+      val oldLease = coord.currentRuntimeSnapshot()!!.lease
+
+      h.noteRepo.notes[note.id] = note.copy(revision = 2L, updatedAt = 41_000L)
+      assertTrue(submitAndAwait(coord) { SessionCommand.ConsolidateNote(ackDeferred = it) } is SessionCommandOutcome.Failed)
+
+      // 1ª etapa: replace falha antes de escrever no Room e leitura de reconciliação falha (Estado F).
+      h.draftRepo.onReplaceHook = { _, _ -> throw IOException("Falha antes de substituir") }
+      h.draftRepo.onGetCheckpointHook = { throw IOException("Falha temporária de leitura") }
+      assertTrue(
+        submitAndAwait(coord) {
+          SessionCommand.ResolveConflict(ConflictResolutionOption.SAVE_DRAFT_AS_NEW_NOTE, it)
+        } is SessionCommandOutcome.Failed
+      )
+      assertTrue(coord.hasUncommittedReplacementForTest())
+
+      // 2ª etapa: leitura se recupera, CloseSession reconcilia como RevertedToOld e terminal cleanup libera preservedLease.
+      h.draftRepo.onGetCheckpointHook = null
+      val closeOutcome = submitAndAwait(coord) { SessionCommand.CloseSession(it) }
+      coord.awaitTerminated()
+
+      assertEquals(SessionCommandOutcome.Completed, closeOutcome)
+      assertEquals(oldLease, coord.latestCommittedLeaseForTest())
+      assertEquals(oldLease, coord.currentRuntimeSnapshot()!!.lease)
+      assertEquals(NoteRecoveryDraftKeys.forExistingNote(note.id, "close-rev-old"), coord.uiState.value.sessionIdentity!!.draftId)
+      assertFalse(coord.hasUncommittedReplacementForTest())
+      assertFalse(h.registry.isLeaseActive(oldLease))
+      assertTrue(h.registry.snapshot().reservedSessionIds.isEmpty())
+      assertTrue(h.registry.snapshot().reservedDraftIds.isEmpty())
+    }
+
+  @Test
+  fun closeSession_whenReconcilerRemainsIndeterminateReadFailure_keepsOldLeaseAndPreservesPendingHandoff() =
+    runTest {
+      val h = CoordinatorHarness(this)
+      val note = h.noteRepo.seedNote(id = 94L, title = "Nota 94", revision = 1L)
+      val coord =
+        h.createCoordinator(
+          openRequest = NoteEditorOpenRequest.OpenExisting(noteId = note.id, sessionId = "close-indet-old"),
+          parentScope = this,
+          sessionIdProvider = { "close-indet-new" },
+        )
+      coord.start()
+      testScheduler.runCurrent()
+      coord.awaitInitialized()
+
+      submitMutation(coord, SessionCommand.EditTitle("Draft leitura indeterminada"))
+      assertEquals(SessionCommandOutcome.Completed, submitAndAwait(coord) { SessionCommand.FlushAutosave(it) })
+      val oldRuntime = coord.currentRuntimeSnapshot()!!
+      val oldLease = oldRuntime.lease
+      val oldDraftId = oldRuntime.identity.draftId
+
+      h.noteRepo.notes[note.id] = note.copy(revision = 2L, updatedAt = 42_000L)
+      assertTrue(submitAndAwait(coord) { SessionCommand.ConsolidateNote(ackDeferred = it) } is SessionCommandOutcome.Failed)
+
+      h.draftRepo.onReplaceHook = { oldId, newInput ->
+        h.draftRepo.defaultReplace(oldId, newInput)
+        throw IOException("Queda após replace")
+      }
+      h.draftRepo.onGetCheckpointHook = { throw IOException("Leitura persistentemente indisponível") }
+
+      assertTrue(
+        submitAndAwait(coord) {
+          SessionCommand.ResolveConflict(ConflictResolutionOption.SAVE_DRAFT_AS_NEW_NOTE, it)
+        } is SessionCommandOutcome.Failed
+      )
+
+      val closeOutcome = submitAndAwait(coord) { SessionCommand.CloseSession(it) }
+      coord.awaitTerminated()
+
+      assertTrue(closeOutcome is SessionCommandOutcome.Failed)
+      assertEquals(oldLease, coord.latestCommittedLeaseForTest())
+      assertEquals(oldLease, coord.currentRuntimeSnapshot()!!.lease)
+      assertEquals(oldRuntime.identity, coord.currentRuntimeSnapshot()!!.identity)
+      assertTrue(coord.hasUncommittedReplacementForTest())
+      assertEquals(
+        ReplacementHandoffStatus.PENDING,
+        h.handoffTracker.findActiveCandidate(oldDraftId)?.status,
+      )
+      assertTrue(h.registry.snapshot().reservedSessionIds.isEmpty())
+      assertTrue(h.registry.snapshot().reservedDraftIds.isEmpty())
     }
 
   private class TestPreferencesRepository : PreferencesRepository {

@@ -1,5 +1,6 @@
 package com.example.ui.viewmodel
 
+import androidx.annotation.VisibleForTesting
 import com.example.core.coroutines.DispatcherProvider
 import com.example.core.time.ClockProvider
 import com.example.domain.editor.ConflictResolutionOption
@@ -107,6 +108,11 @@ class NoteEditorSessionCoordinator(
   private var rescheduleAutosaveAfterInFlight = false
   private val structuralOutcomes = ConcurrentHashMap<Long, StructuralOutcomeData>()
 
+  @VisibleForTesting
+  @Volatile
+  internal var transformStructuralResultForTest: ((StructuralRunnerResult) -> StructuralRunnerResult)? =
+    null
+
   val uiState: StateFlow<NoteEditorUiState> = mailbox.uiState
 
   fun start(): Job {
@@ -138,6 +144,18 @@ class NoteEditorSessionCoordinator(
 
   internal fun currentRuntimeSnapshot(): SessionRuntimeState? =
     runtime?.let { it.copy(knownFolderAvailability = it.knownFolderAvailability.toMutableMap()) }
+
+  @VisibleForTesting
+  internal fun latestCommittedLeaseForTest(): SessionLeaseToken? = latestCommittedLease.get()
+
+  @VisibleForTesting
+  internal fun hasUncommittedReplacementForTest(): Boolean = uncommittedReplacement.get() != null
+
+  @VisibleForTesting
+  internal fun hasPendingBarrierForTest(): Boolean = pendingBarrier != null
+
+  @VisibleForTesting
+  internal fun isMailboxBarrierActiveForTest(): Boolean = mailbox.barrierActive
 
   suspend fun closeAndAbort() {
     val jobToCancel: Job?
@@ -380,6 +398,7 @@ class NoteEditorSessionCoordinator(
           inFlightOpProvider = { inFlightOp },
           clearInFlightOp = { inFlightOp = null },
           uncommittedReplacement = uncommittedReplacement,
+          latestCommittedLease = latestCommittedLease,
           cancelDebounce = ::cancelDebounce,
           drainCompletion = ::handleCompletion,
           publishState = { r, e -> publishCurrentRuntimeState(r, e) },
@@ -754,7 +773,7 @@ class NoteEditorSessionCoordinator(
 
     val job =
       scope.launch(dispatchers.io) {
-        val result: StructuralRunnerResult =
+        val rawResult: StructuralRunnerResult =
           try {
             when (cmd) {
               is SessionCommand.ConsolidateNote ->
@@ -778,6 +797,8 @@ class NoteEditorSessionCoordinator(
           } catch (t: Throwable) {
             StructuralRunnerResult.Failed(t)
           }
+
+        val result = transformStructuralResultForTest?.invoke(rawResult) ?: rawResult
 
         when (result) {
           is StructuralRunnerResult.Succeeded -> {
@@ -1095,6 +1116,8 @@ class NoteEditorSessionCoordinator(
     failure: Throwable?,
     ackDeferred: CompletableDeferred<SessionCommandOutcome>?,
   ) {
+    var recoveredConfirmedPromotion = false
+
     when (data) {
       is StructuralOutcomeData.ConsolidationConflictDetected -> {
         rt.activeConflict = data.conflict
@@ -1123,7 +1146,25 @@ class NoteEditorSessionCoordinator(
             rt.errorMessage = rec.message
             rt.autosaveStatus = AutosaveStatus.Error(message = rec.message, isTerminal = true)
           }
-          is ReplacementReconciliationResult.PromotedToNew -> Unit
+          is ReplacementReconciliationResult.PromotedToNew -> {
+            val baseline =
+              NoteEditorBaseline.NewNote(
+                title = "",
+                normalizedContent =
+                  NoteEditorSessionEvaluator.canonicalizeDocument(NoteContentDocument.empty()),
+                paperStyle = rec.newDraft.initialPaperStyle ?: rec.newDraft.paperStyle,
+                staticFolderId = rec.newDraft.initialFolderId,
+                initialIsPinned = false,
+              )
+            applyPromotedNewNoteState(
+              rt = rt,
+              newIdentity = rec.newIdentity,
+              newLease = rec.newLease,
+              newDraft = rec.newDraft,
+              newBaseline = baseline,
+            )
+            recoveredConfirmedPromotion = true
+          }
         }
       }
       else -> {
@@ -1140,10 +1181,14 @@ class NoteEditorSessionCoordinator(
 
     publishCurrentRuntimeState(rt, eng)
     ackDeferred?.complete(
-      SessionCommandOutcome.Failed(
-        message = failure?.message ?: "Falha na operação estrutural.",
-        cause = failure,
-      )
+      if (recoveredConfirmedPromotion) {
+        SessionCommandOutcome.Completed
+      } else {
+        SessionCommandOutcome.Failed(
+          message = failure?.message ?: "Falha na operação estrutural.",
+          cause = failure,
+        )
+      }
     )
     pendingBarrier = null
     mailbox.releaseBarrier(barrier.token)
@@ -1278,6 +1323,7 @@ class NoteEditorSessionCoordinator(
     rt.identity = newIdentity
     rt.lease = newLease
     latestCommittedLease.set(newLease)
+    uncommittedReplacement.set(null)
     rt.baseline = newBaseline
     rt.persistedInitialFolderId = newDraft.initialFolderId
     rt.persistedInitialPaperStyle = newDraft.initialPaperStyle

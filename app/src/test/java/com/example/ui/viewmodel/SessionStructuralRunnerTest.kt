@@ -61,6 +61,7 @@ class SessionStructuralRunnerTest {
         handoffTracker = handoffTracker,
       )
 
+    val committedLeases = mutableListOf<SessionLeaseToken>()
     val runner =
       SessionStructuralRunner(
         noteRepository = noteRepo,
@@ -70,6 +71,19 @@ class SessionStructuralRunnerTest {
         handoffTracker = handoffTracker,
         replacementReconciler = reconciler,
         sessionIdGenerator = { "new-sess-unused" },
+        onLeaseCommitted = { lease -> committedLeases.add(lease) },
+      )
+
+    fun createRunner(sessionIdProvider: () -> String): SessionStructuralRunner =
+      SessionStructuralRunner(
+        noteRepository = noteRepo,
+        folderRepository = folderRepo,
+        draftRepository = draftRepo,
+        activeSessionRegistry = registry,
+        handoffTracker = handoffTracker,
+        replacementReconciler = reconciler,
+        sessionIdGenerator = sessionIdProvider,
+        onLeaseCommitted = { lease -> committedLeases.add(lease) },
       )
 
     fun createIdentity(noteId: Long, sessionId: String = "sess-keep"): NoteEditorSessionIdentity =
@@ -654,6 +668,348 @@ class SessionStructuralRunnerTest {
       assertTrue(h.draftRepo.savedInputs.isEmpty())
     }
 
+  @Test
+  fun saveDraftAsNewNote_whenRoomCommitSucceededBeforeFaultAndReconcilerReturnsPromotedToNew_returnsSucceededAndClearsPendingContext() =
+    runTest {
+      val h = RunnerHarness()
+      val note = h.noteRepo.seedNote(id = 91L, title = "Original 91", revision = 1L)
+      val oldIdentity = h.createIdentity(note.id, sessionId = "runner-a-old")
+      val editedDoc = NoteContentDocument(blocks = listOf(ParagraphBlock(id = "p1", text = "Texto A")))
+      val runtime =
+        h.createRuntimeSnapshot(
+          identity = oldIdentity,
+          baseline =
+            NoteEditorBaseline.ExistingNote(
+              noteId = note.id,
+              baseRevision = 1L,
+              baseNoteUpdatedAt = 1_000L,
+              title = "Original 91",
+              normalizedContent = NoteEditorSessionEvaluator.canonicalizeDocument(NoteContentDocument.empty()),
+              paperStyle = NotePaperStyle.LINHAS,
+              staticFolderId = null,
+              currentDbIsPinned = false,
+            ),
+          snapshot =
+            NoteEditorEditableSnapshot(
+              title = "Título A",
+              document = editedDoc,
+              effectiveFolderId = null,
+              fallbackSourceFolderId = null,
+              paperStyle = NotePaperStyle.PONTILHADO,
+              isPinned = true,
+            ),
+          folderContext = ResolvedDraftFolderContext(effectiveTarget = FolderAvailability.Root),
+        )
+      val executor = h.createExecutor(identity = oldIdentity, confirmedRevision = 1L)
+      var injectFault = true
+      h.draftRepo.onReplaceHook = { oldId, newInput ->
+        val res = h.draftRepo.defaultReplace(oldId, newInput)
+        if (injectFault) {
+          injectFault = false
+          throw IOException("Queda após commit no SQLite")
+        }
+        res
+      }
+      val pendingCalls = mutableListOf<UncommittedReplacementContext?>()
+      val runner = h.createRunner { "runner-a-new" }
+
+      val result =
+        runner.runResolveConflict(
+          command = SessionCommand.ResolveConflict(ConflictResolutionOption.SAVE_DRAFT_AS_NEW_NOTE),
+          runtimeSnapshot = runtime,
+          executor = executor,
+          onPendingReplacementSet = { ctx -> pendingCalls.add(ctx) },
+        )
+
+      assertTrue(result is StructuralRunnerResult.Succeeded)
+      val outcome = (result as StructuralRunnerResult.Succeeded).data as StructuralOutcomeData.ReconciledIndeterminate
+      val rec = outcome.result as ReplacementReconciliationResult.PromotedToNew
+      assertEquals(NoteRecoveryDraftKeys.forNewNote("runner-a-new"), rec.newIdentity.draftId)
+      assertEquals(listOf(rec.newLease), h.committedLeases)
+      assertEquals(2, pendingCalls.size)
+      assertNotNull(pendingCalls.first())
+      assertNull(pendingCalls.last())
+      assertTrue(h.registry.isSessionReserved("runner-a-new"))
+      assertFalse(h.registry.isSessionReserved("runner-a-old"))
+      assertEquals(
+        ReplacementHandoffStatus.RESOLVED_TO_NEW,
+        h.handoffTracker.findActiveCandidate(oldIdentity.draftId)?.status,
+      )
+    }
+
+  @Test
+  fun saveDraftAsNewNote_whenRegistryCommitReturnsRejectedAlreadyRolledBack_handlesDivergentAndReadFailureWithoutLeavingStalePromotedState() =
+    runTest {
+      // Subcaso 1: release(sourceLease) durante a substituição no Room provoca RejectedAlreadyRolledBack
+      // e reconciliação em DivergentAnomaly("REGISTRY_COMMIT_REJECTED") limpa o contexto pendente.
+      val h1 = RunnerHarness()
+      val note1 = h1.noteRepo.seedNote(id = 92L, title = "Nota 92", revision = 1L)
+      val id1 = h1.createIdentity(note1.id, sessionId = "reg-rej-1")
+      val rt1 =
+        h1.createRuntimeSnapshot(
+          identity = id1,
+          baseline =
+            NoteEditorBaseline.ExistingNote(
+              noteId = note1.id,
+              baseRevision = 1L,
+              baseNoteUpdatedAt = 1_000L,
+              title = "Nota 92",
+              normalizedContent = NoteEditorSessionEvaluator.canonicalizeDocument(NoteContentDocument.empty()),
+              paperStyle = NotePaperStyle.LINHAS,
+              staticFolderId = null,
+              currentDbIsPinned = false,
+            ),
+          snapshot =
+            NoteEditorEditableSnapshot(
+              title = "Draft 92",
+              document = NoteContentDocument.empty(),
+              effectiveFolderId = null,
+              fallbackSourceFolderId = null,
+              paperStyle = NotePaperStyle.LINHAS,
+              isPinned = false,
+            ),
+          folderContext = ResolvedDraftFolderContext(effectiveTarget = FolderAvailability.Root),
+        )
+      val exec1 = h1.createExecutor(identity = id1, confirmedRevision = 1L)
+      h1.draftRepo.onReplaceHook = { oldId, newInput ->
+        // Libera sourceLease durante a janela de I/O, marcando a transferência pendente como RolledBack.
+        h1.registry.release(rt1.lease)
+        h1.draftRepo.defaultReplace(oldId, newInput)
+      }
+      val pendingCalls1 = mutableListOf<UncommittedReplacementContext?>()
+      val res1 =
+        h1.createRunner { "reg-rej-1-new" }.runResolveConflict(
+          command = SessionCommand.ResolveConflict(ConflictResolutionOption.SAVE_DRAFT_AS_NEW_NOTE),
+          runtimeSnapshot = rt1,
+          executor = exec1,
+          onPendingReplacementSet = { ctx -> pendingCalls1.add(ctx) },
+        )
+
+      assertTrue(res1 is StructuralRunnerResult.Failed)
+      val failed1 = res1 as StructuralRunnerResult.Failed
+      assertTrue(failed1.cause.message!!.contains("Commit no Registry falhou"))
+      val outcome1 = failed1.fallbackData as StructuralOutcomeData.ReconciledIndeterminate
+      val anomaly1 = outcome1.result as ReplacementReconciliationResult.DivergentAnomaly
+      assertEquals("REGISTRY_COMMIT_REJECTED", anomaly1.stateCode)
+      assertTrue(h1.committedLeases.isEmpty())
+      assertEquals(2, pendingCalls1.size)
+      assertNotNull(pendingCalls1.first())
+      assertNull(pendingCalls1.last())
+
+      // Subcaso 2: se a leitura de confirmação pós-replace falhar com IndeterminateReadFailure,
+      // preserva o contexto pendente (não chama onPendingReplacementSet(null)).
+      val h2 = RunnerHarness()
+      val note2 = h2.noteRepo.seedNote(id = 93L, title = "Nota 93", revision = 1L)
+      val id2 = h2.createIdentity(note2.id, sessionId = "reg-rej-2")
+      val rt2 =
+        h2.createRuntimeSnapshot(
+          identity = id2,
+          baseline =
+            NoteEditorBaseline.ExistingNote(
+              noteId = note2.id,
+              baseRevision = 1L,
+              baseNoteUpdatedAt = 1_000L,
+              title = "Nota 93",
+              normalizedContent = NoteEditorSessionEvaluator.canonicalizeDocument(NoteContentDocument.empty()),
+              paperStyle = NotePaperStyle.LINHAS,
+              staticFolderId = null,
+              currentDbIsPinned = false,
+            ),
+          snapshot =
+            NoteEditorEditableSnapshot(
+              title = "Draft 93",
+              document = NoteContentDocument.empty(),
+              effectiveFolderId = null,
+              fallbackSourceFolderId = null,
+              paperStyle = NotePaperStyle.LINHAS,
+              isPinned = false,
+            ),
+          folderContext = ResolvedDraftFolderContext(effectiveTarget = FolderAvailability.Root),
+        )
+      val exec2 = h2.createExecutor(identity = id2, confirmedRevision = 1L)
+      h2.draftRepo.onReplaceHook = { oldId, newInput ->
+        h2.registry.release(rt2.lease)
+        h2.draftRepo.defaultReplace(oldId, newInput)
+      }
+      h2.draftRepo.onGetCheckpointHook = { throw IOException("Falha de leitura após RejectedAlreadyRolledBack") }
+      val pendingCalls2 = mutableListOf<UncommittedReplacementContext?>()
+      val res2 =
+        h2.createRunner { "reg-rej-2-new" }.runResolveConflict(
+          command = SessionCommand.ResolveConflict(ConflictResolutionOption.SAVE_DRAFT_AS_NEW_NOTE),
+          runtimeSnapshot = rt2,
+          executor = exec2,
+          onPendingReplacementSet = { ctx -> pendingCalls2.add(ctx) },
+        )
+
+      assertTrue(res2 is StructuralRunnerResult.Failed)
+      val failed2 = res2 as StructuralRunnerResult.Failed
+      assertTrue(failed2.cause is IOException)
+      val outcome2 = failed2.fallbackData as StructuralOutcomeData.ReconciledIndeterminate
+      assertTrue(outcome2.result is ReplacementReconciliationResult.IndeterminateReadFailure)
+      assertTrue(h2.committedLeases.isEmpty())
+      assertEquals(1, pendingCalls2.size)
+      assertNotNull(pendingCalls2.single())
+    }
+
+  @Test
+  fun saveDraftAsNewNote_whenReconcilerReturnsIndeterminateReadFailure_preservesPendingReplacementContext() =
+    runTest {
+      val h = RunnerHarness()
+      val note = h.noteRepo.seedNote(id = 94L, title = "Nota 94", revision = 1L)
+      val oldIdentity = h.createIdentity(note.id, sessionId = "runner-f-old")
+      val runtime =
+        h.createRuntimeSnapshot(
+          identity = oldIdentity,
+          baseline =
+            NoteEditorBaseline.ExistingNote(
+              noteId = note.id,
+              baseRevision = 1L,
+              baseNoteUpdatedAt = 1_000L,
+              title = "Nota 94",
+              normalizedContent = NoteEditorSessionEvaluator.canonicalizeDocument(NoteContentDocument.empty()),
+              paperStyle = NotePaperStyle.LINHAS,
+              staticFolderId = null,
+              currentDbIsPinned = false,
+            ),
+          snapshot =
+            NoteEditorEditableSnapshot(
+              title = "Draft F",
+              document = NoteContentDocument.empty(),
+              effectiveFolderId = null,
+              fallbackSourceFolderId = null,
+              paperStyle = NotePaperStyle.LINHAS,
+              isPinned = false,
+            ),
+          folderContext = ResolvedDraftFolderContext(effectiveTarget = FolderAvailability.Root),
+        )
+      val executor = h.createExecutor(identity = oldIdentity, confirmedRevision = 1L)
+      h.draftRepo.onReplaceHook = { oldId, newInput ->
+        h.draftRepo.defaultReplace(oldId, newInput)
+        throw IOException("Queda no replace")
+      }
+      h.draftRepo.onGetCheckpointHook = { throw IOException("Falha de leitura na reconciliação") }
+      val pendingCalls = mutableListOf<UncommittedReplacementContext?>()
+
+      val result =
+        h.createRunner { "runner-f-new" }.runResolveConflict(
+          command = SessionCommand.ResolveConflict(ConflictResolutionOption.SAVE_DRAFT_AS_NEW_NOTE),
+          runtimeSnapshot = runtime,
+          executor = executor,
+          onPendingReplacementSet = { ctx -> pendingCalls.add(ctx) },
+        )
+
+      assertTrue(result is StructuralRunnerResult.Failed)
+      val failed = result as StructuralRunnerResult.Failed
+      assertTrue(failed.cause is IOException)
+      val outcome = failed.fallbackData as StructuralOutcomeData.ReconciledIndeterminate
+      assertTrue(outcome.result is ReplacementReconciliationResult.IndeterminateReadFailure)
+      assertTrue(h.committedLeases.isEmpty())
+      assertEquals(1, pendingCalls.size)
+      assertNotNull(pendingCalls.single())
+      assertEquals(
+        ReplacementHandoffStatus.PENDING,
+        h.handoffTracker.findActiveCandidate(oldIdentity.draftId)?.status,
+      )
+    }
+
+  @Test
+  fun saveDraftAsNewNote_whenReconcilerReturnsRevertedNeitherPresentOrDivergent_returnsFailedAndClearsPendingContext() =
+    runTest {
+      suspend fun runCase(
+        sessionPrefix: String,
+        seedOldDraft: Boolean = true,
+        hook: suspend RunnerHarness.(String, NoteRecoveryDraftInput) -> ReplaceCheckpointWithNewNoteResult,
+      ): ReplacementReconciliationResult {
+        val h = RunnerHarness()
+        val note = h.noteRepo.seedNote(id = 95L, title = "Nota 95", revision = 1L)
+        val oldIdentity = h.createIdentity(note.id, sessionId = "$sessionPrefix-old")
+        if (seedOldDraft) {
+          h.draftRepo.drafts[oldIdentity.draftId] =
+            NoteRecoveryDraft(
+              draftId = oldIdentity.draftId,
+              targetNoteId = note.id,
+              sessionId = oldIdentity.sessionId,
+              folderId = null,
+              initialFolderId = null,
+              fallbackSourceFolderId = null,
+              isPinned = false,
+              title = "Draft $sessionPrefix",
+              contentState = NoteContentState.Valid(NoteContentDocument.empty()),
+              paperStyle = NotePaperStyle.LINHAS,
+              initialPaperStyle = null,
+              baseRevision = 1L,
+              checkpointRevision = 1L,
+              baseNoteUpdatedAt = 1_000L,
+              checkpointAt = 2_000L,
+            )
+        }
+        val runtime =
+          h.createRuntimeSnapshot(
+            identity = oldIdentity,
+            baseline =
+              NoteEditorBaseline.ExistingNote(
+                noteId = note.id,
+                baseRevision = 1L,
+                baseNoteUpdatedAt = 1_000L,
+                title = "Nota 95",
+                normalizedContent = NoteEditorSessionEvaluator.canonicalizeDocument(NoteContentDocument.empty()),
+                paperStyle = NotePaperStyle.LINHAS,
+                staticFolderId = null,
+                currentDbIsPinned = false,
+              ),
+            snapshot =
+              NoteEditorEditableSnapshot(
+                title = "Draft $sessionPrefix",
+                document = NoteContentDocument.empty(),
+                effectiveFolderId = null,
+                fallbackSourceFolderId = null,
+                paperStyle = NotePaperStyle.LINHAS,
+                isPinned = false,
+              ),
+            folderContext = ResolvedDraftFolderContext(effectiveTarget = FolderAvailability.Root),
+          )
+        val executor = h.createExecutor(identity = oldIdentity, confirmedRevision = 1L)
+        h.draftRepo.onReplaceHook = { oldId, newInput -> h.hook(oldId, newInput) }
+        val pendingCalls = mutableListOf<UncommittedReplacementContext?>()
+
+        val result =
+          h.createRunner { "$sessionPrefix-new" }.runResolveConflict(
+            command = SessionCommand.ResolveConflict(ConflictResolutionOption.SAVE_DRAFT_AS_NEW_NOTE),
+            runtimeSnapshot = runtime,
+            executor = executor,
+            onPendingReplacementSet = { ctx -> pendingCalls.add(ctx) },
+          )
+
+        assertTrue(result is StructuralRunnerResult.Failed)
+        assertTrue(h.committedLeases.isEmpty())
+        assertEquals(2, pendingCalls.size)
+        assertNotNull(pendingCalls.first())
+        assertNull(pendingCalls.last())
+        assertTrue(h.registry.isSessionReserved("$sessionPrefix-old"))
+        assertFalse(h.registry.isSessionReserved("$sessionPrefix-new"))
+        val outcome = (result as StructuralRunnerResult.Failed).fallbackData as StructuralOutcomeData.ReconciledIndeterminate
+        return outcome.result
+      }
+
+      val reverted =
+        runCase("reverted") { _, _ -> throw IOException("Falha antes da substituição") }
+      assertTrue(reverted is ReplacementReconciliationResult.RevertedToOld)
+
+      val neither =
+        runCase("neither") { oldId, _ ->
+          draftRepo.drafts.remove(oldId)
+          throw IOException("Sumiu tudo")
+        }
+      assertTrue(neither is ReplacementReconciliationResult.NeitherPresent)
+
+      val divergent =
+        runCase("divergent") { oldId, newInput ->
+          draftRepo.defaultReplace(oldId, newInput.copy(title = "Adulterado"))
+          throw IOException("Payload divergente")
+        }
+      assertTrue(divergent is ReplacementReconciliationResult.DivergentAnomaly)
+    }
+
   private class FakeFolderRepository : FolderRepository {
     val folders = linkedMapOf<Long, Folder>()
     val requestedIds = mutableListOf<Set<Long>>()
@@ -777,42 +1133,34 @@ class SessionStructuralRunnerTest {
   private class RecordingDraftRepository(
     private val clock: ClockProvider,
   ) : NoteRecoveryDraftRepository {
+    val drafts = linkedMapOf<String, NoteRecoveryDraft>()
     val savedInputs = mutableListOf<NoteRecoveryDraftInput>()
     val deletedDraftIds = mutableListOf<String>()
     var onSaveHook: (suspend (NoteRecoveryDraftInput) -> SaveCheckpointResult)? = null
     var onDeleteHook: (suspend (String) -> Unit)? = null
+    var onGetCheckpointHook: (suspend (String) -> Unit)? = null
+    var onReplaceHook: (suspend (String, NoteRecoveryDraftInput) -> ReplaceCheckpointWithNewNoteResult)? = null
 
     override fun observeAllCheckpoints(): Flow<List<NoteRecoveryDraft>> = emptyFlow()
 
-    override suspend fun getAllCheckpoints(): List<NoteRecoveryDraft> = emptyList()
+    override suspend fun getAllCheckpoints(): List<NoteRecoveryDraft> = drafts.values.toList()
 
-    override suspend fun getCheckpointById(draftId: String): NoteRecoveryDraft? = null
+    override suspend fun getCheckpointById(draftId: String): NoteRecoveryDraft? {
+      onGetCheckpointHook?.invoke(draftId)
+      return drafts[draftId]
+    }
 
-    override suspend fun getCheckpointBySessionId(sessionId: String): NoteRecoveryDraft? = null
+    override suspend fun getCheckpointBySessionId(sessionId: String): NoteRecoveryDraft? =
+      drafts.values.firstOrNull { it.sessionId == sessionId }
 
-    override suspend fun getCheckpointsForNote(noteId: Long): List<NoteRecoveryDraft> = emptyList()
+    override suspend fun getCheckpointsForNote(noteId: Long): List<NoteRecoveryDraft> =
+      drafts.values.filter { it.targetNoteId == noteId }
 
     override suspend fun saveCheckpoint(input: NoteRecoveryDraftInput): SaveCheckpointResult {
       savedInputs.add(input)
       onSaveHook?.let { return it.invoke(input) }
-      val draft =
-        NoteRecoveryDraft(
-          draftId = input.draftId,
-          targetNoteId = input.targetNoteId,
-          sessionId = input.sessionId,
-          folderId = input.folderId,
-          initialFolderId = input.initialFolderId,
-          fallbackSourceFolderId = input.fallbackSourceFolderId,
-          isPinned = input.isPinned,
-          title = input.title,
-          contentState = NoteContentState.Valid(NoteContentPolicy.normalizeDocument(input.content)),
-          paperStyle = input.paperStyle,
-          initialPaperStyle = input.initialPaperStyle,
-          baseRevision = input.baseRevision,
-          checkpointRevision = input.checkpointRevision,
-          baseNoteUpdatedAt = input.baseNoteUpdatedAt,
-          checkpointAt = clock.nowMillis(),
-        )
+      val draft = input.toDraft(clock.nowMillis())
+      drafts[input.draftId] = draft
       return SaveCheckpointResult.Saved(draft)
     }
 
@@ -821,13 +1169,53 @@ class SessionStructuralRunnerTest {
       expectedOldSessionId: String,
       expectedOldTargetNoteId: Long,
       newInput: NoteRecoveryDraftInput,
-    ): ReplaceCheckpointWithNewNoteResult = error("unused")
+    ): ReplaceCheckpointWithNewNoteResult {
+      onReplaceHook?.let { return it.invoke(oldDraftId, newInput) }
+      return defaultReplace(oldDraftId, newInput)
+    }
+
+    fun defaultReplace(
+      oldDraftId: String,
+      newInput: NoteRecoveryDraftInput,
+    ): ReplaceCheckpointWithNewNoteResult {
+      val existingNew = drafts[newInput.draftId]
+      val existingOld = drafts[oldDraftId]
+      if (existingOld == null && existingNew != null) {
+        return ReplaceCheckpointWithNewNoteResult.AlreadyReplaced(existingNew)
+      }
+      drafts.remove(oldDraftId)
+      val inserted = newInput.toDraft(clock.nowMillis())
+      drafts[inserted.draftId] = inserted
+      return ReplaceCheckpointWithNewNoteResult.Replaced(inserted)
+    }
 
     override suspend fun deleteCheckpoint(draftId: String) {
       deletedDraftIds.add(draftId)
+      drafts.remove(draftId)
       onDeleteHook?.invoke(draftId)
     }
 
-    override suspend fun deleteCheckpointsForNote(noteId: Long) = error("unused")
+    override suspend fun deleteCheckpointsForNote(noteId: Long) {
+      drafts.entries.removeIf { it.value.targetNoteId == noteId }
+    }
+
+    private fun NoteRecoveryDraftInput.toDraft(at: Long): NoteRecoveryDraft =
+      NoteRecoveryDraft(
+        draftId = draftId,
+        targetNoteId = targetNoteId,
+        sessionId = sessionId,
+        folderId = folderId,
+        initialFolderId = initialFolderId,
+        fallbackSourceFolderId = fallbackSourceFolderId,
+        isPinned = isPinned,
+        title = title,
+        contentState = NoteContentState.Valid(NoteContentPolicy.normalizeDocument(content)),
+        paperStyle = paperStyle,
+        initialPaperStyle = initialPaperStyle,
+        baseRevision = baseRevision,
+        checkpointRevision = checkpointRevision,
+        baseNoteUpdatedAt = baseNoteUpdatedAt,
+        checkpointAt = at,
+      )
   }
 }
